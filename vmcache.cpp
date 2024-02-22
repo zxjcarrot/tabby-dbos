@@ -12,6 +12,9 @@
 #include <thread>
 #include <vector>
 #include <span>
+#include <map>
+#include <condition_variable>
+//#include <liburing.h>
 
 #include <libaio.h>
 #include <sys/mman.h>
@@ -23,10 +26,12 @@
 #include <immintrin.h>
 
 #include "exmap.h"
+#include "exception_hack.hpp"
 
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
+#include "tpcc/ScrambledZipfGenerator.hpp"
 
 using namespace std;
 
@@ -220,20 +225,23 @@ struct ResidentPageSet {
          pos = (pos + 1) & mask;
       }
    }
+
 };
 
 // libaio interface used to write batches of pages
 struct LibaioInterface {
    static const u64 maxIOs = 256;
 
-   int blockfd;
+   // Stripe pages over files.
+   std::vector<int> blockfds;
+   //int blockfd;
    Page* virtMem;
    io_context_t ctx;
    iocb cb[maxIOs];
    iocb* cbPtr[maxIOs];
    io_event events[maxIOs];
 
-   LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
+   LibaioInterface(const std::vector<int> & blockfds, Page* virtMem) : blockfds(blockfds), virtMem(virtMem) {
       memset(&ctx, 0, sizeof(io_context_t));
       if (io_setup(maxIOs, &ctx) != 0)
          die("io_setup error");
@@ -245,14 +253,60 @@ struct LibaioInterface {
          PID pid = pages[i];
          virtMem[pid].dirty = false;
          cbPtr[i] = &cb[i];
-         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
+         int blockfd = blockfds[pid % blockfds.size()];
+         int page_id_in_file = pid / blockfds.size();
+         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*page_id_in_file);
       }
       int cnt = io_submit(ctx, pages.size(), cbPtr);
       assert(cnt == pages.size());
       cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
       assert(cnt == pages.size());
    }
+
+   ssize_t pread(PID pid, void * __buf, size_t __nbytes) {
+      assert(__nbytes == pageSize);
+      int blockfd = blockfds[pid % blockfds.size()];
+      int page_id_in_file = pid / blockfds.size();
+      return ::pread(blockfd, __buf, __nbytes, pageSize * page_id_in_file);
+   }
 };
+
+// struct IOUringInterface {
+//    static const u64 QUEUE_DEPTH = 64;
+//    struct io_uring ring;
+//    int blockfd;
+//    Page* virtMem;
+//    IOUringInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
+//       if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0)) {
+//          die("io_uring_queue_init");
+//       }
+//       if (io_uring_register_files(&ring, &blockfd, 1)) {
+//          die("io_uring_register_files");
+//       }
+//    }
+
+//    ssize_t pread(int __fd, void * __buf, size_t __nbytes, __off_t __offset) {
+//       struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+//       /* Setup a pread operation */
+//       io_uring_prep_read(sqe, __fd, __buf, __nbytes, __offset);
+//       /* Set user data */
+//       io_uring_sqe_set_data(sqe, NULL);
+//       /* Finally, submit the request */
+//       if (io_uring_submit_and_wait(&ring, 1) <= 0) {
+//          die("io_uring_submit_and_wait");
+//       }
+//       struct io_uring_cqe *cqe;
+//       ssize_t ret = io_uring_wait_cqe(&ring, &cqe);
+
+//       if (ret != 0) {
+//          die("io_uring_wait_cqe");
+//       }
+//       ret = cqe->res;
+//       /* Mark this completion as seen */
+//       io_uring_cqe_seen(&ring, cqe);
+//       return ret;
+//    }
+// };
 
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
@@ -263,9 +317,11 @@ struct BufferManager {
    u64 physCount;
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
+   //vector<IOUringInterface> iouringInterface;
 
    bool useExmap;
-   int blockfd;
+   std::vector<int> blockfds;
+   //int blockfd;
    int exmapfd;
 
    atomic<u64> physUsedCount;
@@ -575,14 +631,36 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
+// for string delimiter
+std::vector<std::string> split(std::string s, std::string delimiter) {
+    size_t pos_start = 0, pos_end, delim_len = delimiter.length();
+    std::string token;
+    std::vector<std::string> res;
+
+    while ((pos_end = s.find(delimiter, pos_start)) != std::string::npos) {
+        token = s.substr (pos_start, pos_end - pos_start);
+        pos_start = pos_end + delim_len;
+        res.push_back (token);
+    }
+
+    res.push_back (s.substr (pos_start));
+    return res;
+}
+
 BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
    assert(virtSize>=physSize);
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
-   blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
-   if (blockfd == -1) {
-      cerr << "cannot open BLOCK device '" << path << "'" << endl;
-      exit(EXIT_FAILURE);
+   std::vector<std::string> paths = split(path, ",");
+   //blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
+   for (size_t i = 0; i < paths.size(); ++i) {
+      int blockfd = open(paths[i].c_str(), O_RDWR | O_DIRECT, S_IRWXU);
+      if (blockfd == -1) {
+         cerr << "cannot open BLOCK device '" << paths[i] << "'" << endl;
+         exit(EXIT_FAILURE);
+      }
+      blockfds.push_back(blockfd);
    }
+   
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
    useExmap = envOr("EXMAP", 0);
@@ -591,14 +669,14 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       if (exmapfd < 0) die("open exmap");
 
       struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
+      buffer.fd             = blockfds[0];
+      buffer.max_interfaces = envOr("THREADS", 1);
       buffer.buffer_size    = physCount;
       buffer.flags          = 0;
       if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
          die("ioctl: exmap_setup");
 
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
+      for (unsigned i=0; i<envOr("THREADS", 1); i++) {
          exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
          if (exmapInterface[i] == MAP_FAILED)
             die("setup exmapInterface");
@@ -615,11 +693,13 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       pageState[i].init();
    if (virtMem == MAP_FAILED)
       die("mmap failed");
-
-   libaioInterface.reserve(maxWorkerThreads);
-   for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
-
+   auto nthreads = envOr("THREADS", 1);
+   libaioInterface.reserve(nthreads);
+   for (unsigned i=0; i<nthreads; i++)
+      libaioInterface.emplace_back(LibaioInterface(blockfds, virtMem));
+   // iouringInterface.reserve(maxWorkerThreads);
+   // for (unsigned i=0; i<nthreads; i++)
+   //    iouringInterface.emplace_back(IOUringInterface(blockfd, virtMem));
    physUsedCount = 0;
    allocCount = 1; // pid 0 reserved for meta data
    readCount = 0;
@@ -630,7 +710,7 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
 }
 
 void BufferManager::ensureFreePages() {
-   if (physUsedCount >= physCount*0.95)
+   if (physUsedCount >= physCount*0.97)
       evict();
 }
 
@@ -725,6 +805,8 @@ void BufferManager::readPage(PID pid) {
    if (useExmap) {
       for (u64 repeatCounter=0; ; repeatCounter++) {
          int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
+         //int ret = libaioInterface[workerThreadId].pread(pid, virtMem+pid, pageSize);
+         //int ret = libaioInterface[workerThreadId].pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
          if (ret == pageSize) {
             assert(ret == pageSize);
             readCount++;
@@ -734,7 +816,9 @@ void BufferManager::readPage(PID pid) {
          ensureFreePages();
       }
    } else {
-      int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
+      int ret = libaioInterface[workerThreadId].pread(pid, virtMem+pid, pageSize);
+      //int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
+      //int ret = iouringInterface[workerThreadId].pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
       assert(ret==pageSize);
       readCount++;
    }
@@ -818,7 +902,7 @@ void BufferManager::evict() {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = pageSize / 4;  // merge nodes below this size
+   static const unsigned underFullSize = (pageSize/2) + (pageSize/4);// merge nodes more empty
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
@@ -1692,7 +1776,159 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
       t.join();
 }
 
+int num_cores = 0;
+
+int stick_this_thread_to_core(int core_id) {
+   core_id = core_id % num_cores;
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();    
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
+
+
+
+class ThreadPool {
+public:
+   static constexpr u64 MAX_WORKER_THREADS = 256;
+   // -------------------------------------------------------------------------------------
+   std::atomic<u64> running_threads = 0;
+   std::atomic<bool> keep_running = true;
+   // -------------------------------------------------------------------------------------
+   struct WorkerThread {
+      std::mutex mutex;
+      std::condition_variable cv;
+      std::function<void()> job;
+      bool wt_ready = true;   // Idle
+      bool job_set = false;   // Has job
+      bool job_done = false;  // Job done
+   };
+   std::vector<std::thread> worker_threads;
+   WorkerThread worker_threads_meta[MAX_WORKER_THREADS];
+   u32 workers_count;
+   ThreadPool(int workers) {
+      workers_count = workers;
+      assert(workers_count < MAX_WORKER_THREADS);
+      // -------------------------------------------------------------------------------------
+      worker_threads.reserve(workers_count);
+      for (u64 t_i = 0; t_i < workers_count; t_i++) {
+         worker_threads.emplace_back([&, t_i]() {
+            // -------------------------------------------------------------------------------------
+            running_threads++;
+            while (running_threads != (workers_count))
+               ;
+            auto& meta = worker_threads_meta[t_i];
+            while (keep_running) {
+               std::unique_lock guard(meta.mutex);
+               meta.cv.wait(guard, [&]() { return keep_running == false || meta.job_set; });
+               if (!keep_running) {
+                  break;
+               }
+               meta.wt_ready = false;
+               meta.job();
+               meta.wt_ready = true;
+               meta.job_done = true;
+               meta.job_set = false;
+               meta.cv.notify_one();
+            }
+            running_threads--;
+         });
+      }
+      for (auto& t : worker_threads) {
+         t.detach();
+      }
+      // -------------------------------------------------------------------------------------
+      // Wait until all worker threads are initialized
+      while (running_threads < workers_count) {
+      }
+   }
+
+   // -------------------------------------------------------------------------------------
+   void scheduleJobSync(u64 t_i, std::function<void()> job)
+   {
+      setJob(t_i, job);
+      joinOne(t_i, [&](WorkerThread& meta) { return meta.job_done; });
+   }
+   // -------------------------------------------------------------------------------------
+   void scheduleJobAsync(u64 t_i, std::function<void()> job)
+   {
+      setJob(t_i, job);
+   }
+   // -------------------------------------------------------------------------------------
+   void scheduleJobs(u64 workers, std::function<void()> job)
+   {
+      for (u32 t_i = 0; t_i < workers; t_i++) {
+         setJob(t_i, job);
+      }
+   }
+   void scheduleJobs(u64 workers, std::function<void(u64 t_i)> job)
+   {
+      for (u32 t_i = 0; t_i < workers; t_i++) {
+         setJob(t_i, [=]() { return job(t_i); });
+      }
+   }
+
+   // -------------------------------------------------------------------------------------
+   void joinAll()
+   {
+      for (u32 t_i = 0; t_i < workers_count; t_i++) {
+         joinOne(t_i, [&](WorkerThread& meta) { return meta.wt_ready && !meta.job_set; });
+      }
+   }
+   // -------------------------------------------------------------------------------------
+   void setJob(u64 t_i, std::function<void()> job)
+   {
+      assert(t_i < workers_count);
+      auto& meta = worker_threads_meta[t_i];
+      std::unique_lock guard(meta.mutex);
+      meta.cv.wait(guard, [&]() { return !meta.job_set && meta.wt_ready; });
+      meta.job_set = true;
+      meta.job_done = false;
+      meta.job = job;
+      guard.unlock();
+      meta.cv.notify_one();
+   }
+   // -------------------------------------------------------------------------------------
+   void joinOne(u64 t_i, std::function<bool(WorkerThread&)> condition)
+   {
+      assert(t_i < workers_count);
+      auto& meta = worker_threads_meta[t_i];
+      std::unique_lock guard(meta.mutex);
+      meta.cv.wait(guard, [&]() { return condition(meta); });
+   }
+
+   ~ThreadPool()
+   {
+      keep_running = false;
+      for (u64 t_i = 0; t_i < workers_count; t_i++) {
+         worker_threads_meta[t_i].cv.notify_one();
+      }
+      while (running_threads) {
+      }
+   }
+
+   template<class Fn>
+   void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
+      uint64_t n = end-begin;
+      if (n<nthreads)
+         nthreads = n;
+      uint64_t perThread = n/nthreads;
+      for (unsigned i=0; i<nthreads; i++) {
+         scheduleJobAsync(i, [&,i]() {
+            uint64_t b = (perThread*i) + begin;
+            uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+            fn(i, b, e);
+         });
+      }
+   }
+};
+
+
 int main(int argc, char** argv) {
+   exception_hack::init_phdr_cache();
+   num_cores = sysconf(_SC_NPROCESSORS_ONLN);
    if (bm.useExmap) {
       struct sigaction action;
       action.sa_flags = SA_SIGINFO;
@@ -1704,6 +1940,8 @@ int main(int argc, char** argv) {
    }
 
    unsigned nthreads = envOr("THREADS", 1);
+   ThreadPool pool(nthreads);
+
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -1712,6 +1950,8 @@ int main(int argc, char** argv) {
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
    auto systemName = bm.useExmap ? "exmap" : "vmcache";
+   u64 txnUpperBound = envOr("txnUpperBound", 1000000000);
+   // atomic<u64> txnTotal(0);
 
    auto statFn = [&]() {
       cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
@@ -1722,17 +1962,25 @@ int main(int argc, char** argv) {
          float wmb = (bm.writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
          cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm.batch << endl;
+         // txnTotal += prog;
+         // if (!isRndread && txnTotal >= txnUpperBound) { // tpc-c
+         //    break;
+         // }
       }
       keepRunning = false;
+      cerr << "Benchmark finished" << endl;
    };
 
    if (isRndread) {
+      u64 readRatio = envOr("READRATIO", 100);
+      bool isZipfian = envOr("zipfian", 0);
+      double theta = getenv("theta") ? atof(getenv("theta")) : 0.0;
+      cerr << "random lookup isZipfian " << isZipfian << endl;
       BTree bt;
       bt.splitOrdered = true;
-
       {
          // insert
-         parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+         pool.parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
             workerThreadId = worker;
             array<u8, 120> payload;
             for (u64 i=begin; i<end; i++) {
@@ -1742,27 +1990,45 @@ int main(int argc, char** argv) {
                bt.insert({k1, sizeof(KeyType)}, payload);
             }
          });
+         pool.joinAll();
       }
       cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
+      cerr << "theta " << theta << endl;
 
       bm.readCount = 0;
       bm.writeCount = 0;
+      ScrambledZipfGenerator generator = ScrambledZipfGenerator(0, n, theta);
       thread statThread(statFn);
-
-      parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      pool.parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
          workerThreadId = worker;
          u64 cnt = 0;
          u64 start = rdtsc();
          while (keepRunning.load()) {
             union { u64 v1; u8 k1[sizeof(u64)]; };
-            v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            if (!isZipfian) {
+               v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            }
+            else {
+               v1 = __builtin_bswap64(generator.rand());
+            }
+
 
             array<u8, 120> payload;
-            bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-               memcpy(payload.data(), p.data(), p.size());
-            });
-            assert(succ);
-            assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+
+            if (readRatio == 100 || RandomGenerator::getRand<u64>(0, 100) < readRatio) {
+               bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
+                  memcpy(payload.data(), p.data(), p.size());
+               });
+               assert(succ);
+               assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            } else {
+               RandomGenerator::getRandString(reinterpret_cast<u8*>(payload.data()), sizeof(u8) * 120);
+               bt.updateInPlace({k1, sizeof(u64)}, [&](span<u8> payload_buf) {
+                  memcpy(payload_buf.data(), payload.data(), payload.size());
+                  //fn(*reinterpret_cast<Record*>(payload.data()));
+               });
+               //bt.insert({k1, sizeof(KeyType)}, payload);
+            }
 
             cnt++;
             u64 stop = rdtsc();
@@ -1774,8 +2040,8 @@ int main(int argc, char** argv) {
          }
          txProgress += cnt;
       });
-
       statThread.join();
+      pool.joinAll();
       return 0;
    }
 
@@ -1785,20 +2051,20 @@ int main(int argc, char** argv) {
    vmcacheAdapter<warehouse_t> warehouse;
    vmcacheAdapter<district_t> district;
    vmcacheAdapter<customer_t> customer;
-   customer.tree.splitOrdered = true;
+   // customer.tree.splitOrdered = true;
    vmcacheAdapter<customer_wdl_t> customerwdl;
    vmcacheAdapter<history_t> history;
-   history.tree.splitOrdered = true;
+   // history.tree.splitOrdered = true;
    vmcacheAdapter<neworder_t> neworder;
    vmcacheAdapter<order_t> order;
-   order.tree.splitOrdered = true;
+   // order.tree.splitOrdered = true;
    vmcacheAdapter<order_wdc_t> order_wdc;
    vmcacheAdapter<orderline_t> orderline;
-   orderline.tree.splitOrdered = true;
+   // orderline.tree.splitOrdered = true;
    vmcacheAdapter<item_t> item;
-   item.tree.splitOrdered = true;
+   // item.tree.splitOrdered = true;
    vmcacheAdapter<stock_t> stock;
-   stock.tree.splitOrdered = true;
+   // stock.tree.splitOrdered = true;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
 
@@ -1806,6 +2072,18 @@ int main(int argc, char** argv) {
       tpcc.loadItem();
       tpcc.loadWarehouse();
 
+      // pool.parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      //    workerThreadId = worker;
+      //    for (Integer w_id=begin; w_id<end; w_id++) {
+      //       tpcc.loadStock(w_id);
+      //       tpcc.loadDistrinct(w_id);
+      //       for (Integer d_id = 1; d_id <= 10; d_id++) {
+      //          tpcc.loadCustomer(w_id, d_id);
+      //          tpcc.loadOrders(w_id, d_id);
+      //       }
+      //    }
+      // });
+      // pool.joinAll();
       parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
          workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
@@ -1824,6 +2102,23 @@ int main(int argc, char** argv) {
    bm.writeCount = 0;
    thread statThread(statFn);
 
+   // pool.parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+   //    workerThreadId = worker;
+   //    u64 cnt = 0;
+   //    u64 start = rdtsc();
+   //    while (keepRunning.load()) {
+   //       int w_id = tpcc.urand(1, warehouseCount); // wh crossing
+   //       tpcc.tx(w_id);
+   //       cnt++;
+   //       u64 stop = rdtsc();
+   //       if ((stop-start) > statDiff) {
+   //          txProgress += cnt;
+   //          start = stop;
+   //          cnt = 0;
+   //       }
+   //    }
+   //    txProgress += cnt;
+   // });
    parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
       workerThreadId = worker;
       u64 cnt = 0;
@@ -1843,6 +2138,7 @@ int main(int argc, char** argv) {
    });
 
    statThread.join();
+   // pool.joinAll();
    cerr << "space: " << (bm.allocCount.load()*pageSize)/(float)bm.gb << " GB " << endl;
 
    return 0;

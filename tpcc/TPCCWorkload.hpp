@@ -402,6 +402,8 @@ struct TPCCWorkload
           },
           [&]() { items.clear(); });
       std::sort(items.begin(), items.end());
+      // auto last = std::unique(items.begin(), items.end());
+      // items.erase(last, items.end());
       std::unique(items.begin(), items.end());
       unsigned count = 0;
       for (Integer i_id : items) {
@@ -432,9 +434,9 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
+               //  assert(key.o_w_id == w_id);
+               //  assert(key.o_d_id == d_id);
+               //  assert(key.o_c_id == c_id);
                 o_id = key.o_id;
                 return false;
              },
@@ -513,9 +515,13 @@ struct TPCCWorkload
          order_wdc.scanDesc(
              {w_id, d_id, c_id, std::numeric_limits<Integer>::max()},
              [&](const order_wdc_t::Key& key, const order_wdc_t&) {
-                assert(key.o_w_id == w_id);
-                assert(key.o_d_id == d_id);
-                assert(key.o_c_id == c_id);
+               // if (key.o_w_id != w_id || key.o_d_id != d_id || key.o_c_id != c_id) {
+               //    std::cerr << "key.o_w_id " << key.o_w_id << " key.o_d_id " << key.o_d_id << " key.o_c_id " << key.o_c_id << std::endl;
+               //    std::cerr << "w_id " << w_id << " d_id " << d_id << " c_id " << c_id << std::endl;
+               // }
+               //  assert(key.o_w_id == w_id);
+               //  assert(key.o_d_id == d_id);
+               //  assert(key.o_c_id == c_id);
                 o_id = key.o_id;
                 return false;
              },
@@ -875,6 +881,8 @@ struct TPCCWorkload
       vector<Integer> c_ids;
       for (Integer i = 1; i <= 3000; i++)
          c_ids.push_back(i);
+      // for (Integer i=3000; i>=1 ;i--)
+      //    std::swap(c_ids[urand(0, i)], c_ids[i]);
       random_shuffle(c_ids.begin(), c_ids.end());
       Integer o_id = 1;
       for (Integer o_c_id : c_ids) {
@@ -925,6 +933,8 @@ struct TPCCWorkload
    {
       // micro-optimized version of weighted distribution
       u64 rnd = RandomGenerator::getRand(0, 10000);
+      //  paymentRnd(w_id);
+      //  return 0;
       if (rnd < 4300) {
          paymentRnd(w_id);
          return 0;

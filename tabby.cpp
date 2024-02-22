@@ -13,6 +13,33 @@
 #include <vector>
 #include <span>
 #include <map>
+#include "spinlock.h"
+#include <condition_variable>
+//#include <liburing.h>
+
+// #define BACKWARD_HAS_BFD 1
+
+// // #include "backward.hpp"
+#include "exception_hack.hpp"
+
+#ifndef NDEBUG
+#define TABBY_ASSERT(expr)                                                           \
+	if (!(expr)) {                                                             \
+		printf("ASSERT(" #expr ") at %s:%d in function %s\n", __FILE__,   \
+					__LINE__, __func__);                                       \
+      dune_die();                                                            \
+	}
+#define TABBY_ASSERT2(expr, v)                                                           \
+	if (!(expr)) {                                                             \
+		printf("ASSERT(" #expr ") at %s:%d in function %s, extra str %s\n", __FILE__,   \
+					__LINE__, __func__, (v));                                       \
+      exit(EXIT_FAILURE);                                                  \
+	}
+#else
+#define TABBY_ASSERT(expr) while(0) { !(expr); }
+#define TABBY_ASSERT2(expr, v) while(0) { !(expr); }
+#endif
+
 
 #include <libaio.h>
 #include <sys/mman.h>
@@ -26,6 +53,7 @@
 extern "C"{
 #endif 
 #include "dune.h"
+extern int dune_cnt;
 #ifdef __cplusplus
 }
 #endif
@@ -36,6 +64,7 @@ extern "C"{
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
+#include "tpcc/ScrambledZipfGenerator.hpp"
 
 using namespace std;
 
@@ -46,10 +75,6 @@ typedef uint64_t u64;
 typedef u64 PID; // page id type
 
 static const u64 pageSize = 4096;
-
-struct alignas(4096) Page {
-   bool dirty;
-};
 
 static const int16_t maxWorkerThreads = 256;
 
@@ -79,8 +104,23 @@ void yield(u64 counter) {
    _mm_pause();
 }
 
-struct PageState {
-   atomic<u64> stateAndVersion;
+static constexpr u64 kTabbyInvalidAddr = 0xfffffffffffff000;
+static constexpr u64 kTabbyBaseVMAddressMask = 0xffff000000000000;
+static constexpr u64 kTabbyBaseVMAddress = 0xffff800000000000;
+static constexpr u64 kTabbyVersionMask = 0x00000000000fffff;
+static constexpr u64 kTabbyStateMask = 0x000000000ff00000;
+static constexpr u64 kTabbyAddressSpaceStart = 0xffff800000000000;
+
+// We assume 4-level page table that uses 48-bits of virtual address.
+// Since we use 4KB-aligned pages, the lower 12 bits are always zero.
+// Therefore we have 64-48+12=28 bits of information. 
+// In theory, the maximum database size that can be supported by Tabby is 2^48=256 TiB. 
+// For the 28 available bits, we use 20 bits as version number and 8 bits as state.
+// We keep the VM address in the top 36 bits of the page state.
+// We keep 8 bits as state.
+// We keep the version number at the end.
+struct VMPageState {
+   atomic<u64> vmAddrAndVersionAndState;
 
    static const u64 Unlocked = 0;
    static const u64 MaxShared = 252;
@@ -88,130 +128,558 @@ struct PageState {
    static const u64 Marked = 254;
    static const u64 Evicted = 255;
 
-   PageState() {}
+   VMPageState() {}
 
-   void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
+   //void init() { vmAddrAndVersionAndState.store(sameVersion(kTabbyInvalidAddr, 0, Unlocked), std::memory_order_release); }
 
-   static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
-   static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
+   void init(u64 addr) { vmAddrAndVersionAndState.store(sameVersion(addr, 0, Unlocked), std::memory_order_release); }
+   // Trim a 48-bit vm address down to 36 bits
+   static inline u64 compressNormalVMAddress(u64 addr) { return ((~kTabbyBaseVMAddressMask) & addr) >> 12; }
+   // Recover a 48-bit address from a 36-bit address
+   static inline u64 decompressVMAddress(u64 addr) { return (addr << 12) | kTabbyBaseVMAddressMask; }
 
-   bool tryLockX(u64 oldStateAndVersion) {
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
+   static inline u64 sameVersion(u64 addr, u64 version, u64 newState) { return (compressNormalVMAddress(addr) << 28) | (version) | (newState << 20); }
+   static inline u64 nextVersion(u64 addr, u64 version, u64 newState) { return (compressNormalVMAddress(addr) << 28) | ((version + 1) & kTabbyVersionMask) | (newState << 20); }
+   // static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
+   // static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
+
+   bool tryLockX(u64 oldVMAddrAndStateAndVersion) {
+      auto v = oldVMAddrAndStateAndVersion;
+      return vmAddrAndVersionAndState.compare_exchange_strong(v, nextVersion(getVMAddress(v), getVersion(v), Locked));
    }
 
    void unlockX() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
+      //cerr << "Unlock at state address " << this << endl;
+      TABBY_ASSERT2(getState() == Locked, ToString().c_str());
+      auto v = vmAddrAndVersionAndState.load();
+      vmAddrAndVersionAndState.store(nextVersion(getVMAddress(v), getVersion(v), Unlocked), std::memory_order_release);
    }
 
    void unlockXEvicted() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
+      TABBY_ASSERT(getState() == Locked);
+      auto v = vmAddrAndVersionAndState.load();
+      vmAddrAndVersionAndState.store(nextVersion(getVMAddress(v), getVersion(v), Evicted), std::memory_order_release);
    }
 
-   void downgradeLock() {
-      assert(getState() == Locked);
-      stateAndVersion.store(nextVersion(stateAndVersion.load(), 1), std::memory_order_release);
+   void unlockXInvalidated() {
+      TABBY_ASSERT2(getState() == Locked, "unlockXInvalidated");
+      auto v = vmAddrAndVersionAndState.load();
+      vmAddrAndVersionAndState.store(nextVersion(kTabbyInvalidAddr, getVersion(v), Unlocked), std::memory_order_release);
+   }
+
+   void downgradeLock() { // downgrade from X-lock to S-lock
+      TABBY_ASSERT(getState() == Locked);
+      auto v = vmAddrAndVersionAndState.load();
+      vmAddrAndVersionAndState.store(nextVersion(getVMAddress(v), getVersion(v), 1), // We are the only reader
+                                     std::memory_order_release);
    }
 
    bool tryLockS(u64 oldStateAndVersion) {
-      u64 s = getState(oldStateAndVersion);
+      auto v = oldStateAndVersion;
+      u64 s = getState(v);
+
       if (s<MaxShared)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s+1));
+         return vmAddrAndVersionAndState.compare_exchange_strong(v, sameVersion(getVMAddress(v), getVersion(v), s+1));
       if (s==Marked)
-         return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
+         return vmAddrAndVersionAndState.compare_exchange_strong(v, sameVersion(getVMAddress(v), getVersion(v), 1));
       return false;
    }
 
    void unlockS() {
       while (true) {
-         u64 oldStateAndVersion = stateAndVersion.load();
-         u64 state = getState(oldStateAndVersion);
-         assert(state>0 && state<=MaxShared);
-         if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state-1)))
+         u64 v = vmAddrAndVersionAndState.load();
+         u64 state = getState(v);
+         if (!(state>0 && state<=MaxShared)) {
+            std::cerr << "unlockS state " << state  << " vmaddr " << getVMAddress(v) << std::endl;
+         }
+         TABBY_ASSERT(state>0 && state<=MaxShared);
+         if (vmAddrAndVersionAndState.compare_exchange_strong(v, sameVersion(getVMAddress(v), getVersion(v), state-1)))
             return;
       }
    }
 
    bool tryMark(u64 oldStateAndVersion) {
-      assert(getState(oldStateAndVersion)==Unlocked);
-      return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Marked));
+      u64 v = oldStateAndVersion;
+      assert(getState(v)==Unlocked);
+      return vmAddrAndVersionAndState.compare_exchange_strong(v, sameVersion(getVMAddress(v), getVersion(v), Marked));
    }
 
-   static u64 getState(u64 v) { return v >> 56; };
-   u64 getState() { return getState(stateAndVersion.load()); }
+   static u64 getState(u64 v) { return (v & kTabbyStateMask) >> 20; };
+   static u64 getVersion(u64 v) { return v & kTabbyVersionMask; };
+   static u64 getVMAddress(u64 v) { return decompressVMAddress(v >> 28); };
+   u64 getState() { return getState(vmAddrAndVersionAndState.load()); }
+   u64 getVMAddress() { return getVMAddress(vmAddrAndVersionAndState.load()); }
+   u64 getVersion() { return getVersion(vmAddrAndVersionAndState.load()); }
 
-   void operator=(PageState&) = delete;
+   void operator=(VMPageState&) = delete;
+
+   u64 getWord() { return vmAddrAndVersionAndState.load(); }
+
+   std::string ToString() {
+      return "Raw: " + std::to_string(getWord()) + ", VMAddress " + std::to_string(getVMAddress()) + ", version " + std::to_string(getVersion()) + ", state " + std::to_string(getState());
+   }
 };
 
-// open addressing hash table used for second chance replacement to keep track of currently-cached pages
-struct ResidentPageSet {
-   static const u64 empty = ~0ull;
-   static const u64 tombstone = (~0ull)-1;
+struct alignas(4096) Page {
+   VMPageState state;
+   bool dirty;
+};
 
-   struct Entry {
-      atomic<u64> pid;
-   };
 
-   Entry* ht;
-   u64 count;
-   u64 mask;
+
+static const u64 metadataPageId = 0;
+
+struct alignas(4096) MetaDataPage {
+   VMPageState state;
+   bool dirty;
+   PID roots[(pageSize- sizeof(VMPageState) - sizeof(dirty))/8];
+
+   PID getRoot(unsigned slot) { return roots[slot]; }
+};
+
+// struct PageState {
+//    atomic<u64> stateAndVersion;
+
+//    static const u64 Unlocked = 0;
+//    static const u64 MaxShared = 252;
+//    static const u64 Locked = 253;
+//    static const u64 Marked = 254;
+//    static const u64 Evicted = 255;
+
+//    PageState() {}
+
+//    void init() { stateAndVersion.store(sameVersion(0, Evicted), std::memory_order_release); }
+
+//    static inline u64 sameVersion(u64 oldStateAndVersion, u64 newState) { return ((oldStateAndVersion<<8)>>8) | newState<<56; }
+//    static inline u64 nextVersion(u64 oldStateAndVersion, u64 newState) { return (((oldStateAndVersion<<8)>>8)+1) | newState<<56; }
+
+//    bool tryLockX(u64 oldStateAndVersion) {
+//       return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Locked));
+//    }
+
+//    void unlockX() {
+//       assert(getState() == Locked);
+//       stateAndVersion.store(nextVersion(stateAndVersion.load(), Unlocked), std::memory_order_release);
+//    }
+
+//    void unlockXEvicted() {
+//       assert(getState() == Locked);
+//       stateAndVersion.store(nextVersion(stateAndVersion.load(), Evicted), std::memory_order_release);
+//    }
+
+//    void downgradeLock() {
+//       assert(getState() == Locked);
+//       stateAndVersion.store(nextVersion(stateAndVersion.load(), 1), std::memory_order_release);
+//    }
+
+//    bool tryLockS(u64 oldStateAndVersion) {
+//       u64 s = getState(oldStateAndVersion);
+//       if (s<MaxShared)
+//          return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, s+1));
+//       if (s==Marked)
+//          return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, 1));
+//       return false;
+//    }
+
+//    void unlockS() {
+//       while (true) {
+//          u64 oldStateAndVersion = stateAndVersion.load();
+//          u64 state = getState(oldStateAndVersion);
+//          assert(state>0 && state<=MaxShared);
+//          if (stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, state-1)))
+//             return;
+//       }
+//    }
+
+//    bool tryMark(u64 oldStateAndVersion) {
+//       assert(getState(oldStateAndVersion)==Unlocked);
+//       return stateAndVersion.compare_exchange_strong(oldStateAndVersion, sameVersion(oldStateAndVersion, Marked));
+//    }
+
+//    static u64 getState(u64 v) { return v >> 56; };
+//    u64 getState() { return getState(stateAndVersion.load()); }
+
+//    void operator=(PageState&) = delete;
+// };
+
+// // open addressing hash table used for second chance replacement to keep track of currently-cached pages
+// struct ResidentPageSet {
+//    static const u64 empty = ~0ull;
+//    static const u64 tombstone = (~0ull)-1;
+
+//    struct Entry {
+//       atomic<u64> pid;
+//    };
+
+//    Entry* ht;
+//    u64 count;
+//    u64 mask;
+//    atomic<u64> clockPos;
+
+//    ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
+//       ht = (Entry*)allocHuge(count * sizeof(Entry));
+//       memset((void*)ht, 0xFF, count * sizeof(Entry));
+//    }
+
+//    ~ResidentPageSet() {
+//       munmap(ht, count * sizeof(u64));
+//    }
+
+//    u64 next_pow2(u64 x) {
+//       return 1<<(64-__builtin_clzl(x-1));
+//    }
+
+//    u64 hash(u64 k) {
+//       const u64 m = 0xc6a4a7935bd1e995;
+//       const int r = 47;
+//       u64 h = 0x8445d61a4e774912 ^ (8*m);
+//       k *= m;
+//       k ^= k >> r;
+//       k *= m;
+//       h ^= k;
+//       h *= m;
+//       h ^= h >> r;
+//       h *= m;
+//       h ^= h >> r;
+//       return h;
+//    }
+
+//    void insert(u64 pid) {
+//       u64 pos = hash(pid) & mask;
+//       while (true) {
+//          u64 curr = ht[pos].pid.load();
+//          assert(curr != pid);
+//          if ((curr == empty) || (curr == tombstone))
+//             if (ht[pos].pid.compare_exchange_strong(curr, pid))
+//                return;
+
+//          pos = (pos + 1) & mask;
+//       }
+//    }
+
+//    bool remove(u64 pid) {
+//       u64 pos = hash(pid) & mask;
+//       while (true) {
+//          u64 curr = ht[pos].pid.load();
+//          if (curr == empty)
+//             return false;
+
+//          if (curr == pid)
+//             if (ht[pos].pid.compare_exchange_strong(curr, tombstone))
+//                return true;
+
+//          pos = (pos + 1) & mask;
+//       }
+//    }
+
+//    template<class Fn>
+//    void iterateClockBatch(u64 batch, Fn fn) {
+//       u64 pos, newPos;
+//       do {
+//          pos = clockPos.load();
+//          newPos = (pos+batch) % count;
+//       } while (!clockPos.compare_exchange_strong(pos, newPos));
+
+//       for (u64 i=0; i<batch; i++) {
+//          u64 curr = ht[pos].pid.load();
+//          if ((curr != tombstone) && (curr != empty))
+//             fn(curr);
+//          pos = (pos + 1) & mask;
+//       }
+//    }
+// };
+
+// libaio interface used to write batches of pages
+struct LibaioInterface {
+   static const u64 maxIOs = 256;
+
+   std::vector<int> blockfds;
+   Page* virtMem;
+   io_context_t ctx;
+   iocb cb[maxIOs];
+   iocb* cbPtr[maxIOs];
+   io_event events[maxIOs];
+
+   LibaioInterface(const std::vector<int> & blockfds, Page* virtMem) : blockfds(blockfds), virtMem(virtMem) {
+      memset(&ctx, 0, sizeof(io_context_t));
+      int ret;
+      if ((ret = io_setup(maxIOs, &ctx)) != 0) {
+         printf("io_setup %s\n", strerror(-ret));
+         exit(EXIT_FAILURE);
+      }
+   }
+
+   // void writePages(const vector<PID>& pages) {
+   //    assert(pages.size() < maxIOs);
+   //    for (u64 i=0; i<pages.size(); i++) {
+   //       PID pid = pages[i];
+   //       virtMem[pid].dirty = false;
+   //       cbPtr[i] = &cb[i];
+   //       io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
+   //    }
+   //    int cnt = io_submit(ctx, pages.size(), cbPtr);
+   //    assert(cnt == pages.size());
+   //    cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
+   //    assert(cnt == pages.size());
+   // }
+
+   void writePages(const vector<Page*>& pages) {
+      // int cpu_id = dune_get_cpu_id();
+      // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+      //    dune_printf("cpu_id %d writePages %d\n", cpu_id, pages.size());		
+      // }
+      TABBY_ASSERT(pages.size() < maxIOs);
+      for (u64 i=0; i<pages.size(); i++) {
+         Page * page = pages[i];
+         page->dirty = false;
+         TABBY_ASSERT(page->state.getVMAddress() != kTabbyInvalidAddr);
+         u64 offset = page->state.getVMAddress() - kTabbyAddressSpaceStart;
+         TABBY_ASSERT(page->state.getState() == VMPageState::Locked);
+         TABBY_ASSERT2((offset & (pageSize - 1)) == 0, std::to_string(offset).c_str());
+         cbPtr[i] = &cb[i];
+         PID pid = offset / pageSize;
+         int blockfd = blockfds[pid % blockfds.size()];
+         PID page_id_in_file = pid / blockfds.size();
+         io_prep_pwrite(cb+i, blockfd, page, pageSize, page_id_in_file * pageSize);
+      }
+      int cnt = io_submit(ctx, pages.size(), cbPtr);
+      TABBY_ASSERT(cnt == pages.size());
+      cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
+      TABBY_ASSERT(cnt == pages.size());
+      // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+      //    dune_printf("cpu_id %d writePages %d done\n", cpu_id, pages.size());		
+      // }
+   }
+
+   ssize_t pread(PID pid, void * __buf, size_t __nbytes) {
+      assert(__nbytes == pageSize);
+      int blockfd = blockfds[pid % blockfds.size()];
+      int page_id_in_file = pid / blockfds.size();
+      return ::pread(blockfd, __buf, __nbytes, pageSize * page_id_in_file);
+   }
+};
+
+
+// struct IOUringInterface {
+//    static const u64 QUEUE_DEPTH = 64;
+//    struct io_uring ring;
+//    int blockfd;
+//    Page* virtMem;
+//    IOUringInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
+//       if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0)) {
+//          die("io_uring_queue_init");
+//       }
+//       if (io_uring_register_files(&ring, &blockfd, 1)) {
+//          die("io_uring_register_files");
+//       }
+//    }
+
+//    ssize_t pread(int __fd, void * __buf, size_t __nbytes, __off_t __offset) {
+//       struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+//       /* Setup a pread operation */
+//       io_uring_prep_read(sqe, __fd, __buf, __nbytes, __offset);
+//       /* Set user data */
+//       io_uring_sqe_set_data(sqe, NULL);
+//       /* Finally, submit the request */
+//       if (io_uring_submit_and_wait(&ring, 1) <= 0) {
+//          die("io_uring_submit_and_wait");
+//       }
+//       struct io_uring_cqe *cqe;
+//       ssize_t ret = io_uring_wait_cqe(&ring, &cqe);
+
+//       if (ret != 0) {
+//          die("io_uring_wait_cqe");
+//       }
+//       ret = cqe->res;
+//       /* Mark this completion as seen */
+//       io_uring_cqe_seen(&ring, cqe);
+//       return ret;
+//    }
+// };
+
+static constexpr u64 kNumGlobalFreeLists = 64;
+static constexpr u64 kLocalFreeListSoftLimit = 64;
+static constexpr u64 kLocalFreeListHardLimit = 80;
+struct FramesMemoryManager {
+   Page* framesMem;
+   u64 physCount;
    atomic<u64> clockPos;
+   // std::mutex slotMutexes[kNumGlobalFreeLists];
+   // vector<Page*> globalFreeLists[kNumGlobalFreeLists]; 
+   struct alignas(64)  FreeList {
+      std::mutex mtx;
+      // spinlock mtx;
+      std::vector<Page*> list;
+      int count;
+      FreeList() {
+         // cerr << "mtx " << &mtx << endl;
+         count = 0;
+      }
+      void push(Page * p) {
+         list.push_back(p);
+         count = list.size();
+      }
+      Page* pop() {
+         Page * p = list.back();
+         list.pop_back();
+         count = list.size();
+         return p;
+      }
+   };
+   FreeList freelists[kNumGlobalFreeLists];
 
-   ResidentPageSet(u64 maxCount) : count(next_pow2(maxCount * 1.5)), mask(count - 1), clockPos(0) {
-      ht = (Entry*)allocHuge(count * sizeof(Entry));
-      memset((void*)ht, 0xFF, count * sizeof(Entry));
-   }
+   // thread_local static FreeList freelist;
+   thread_local static int last_stolen;
 
-   ~ResidentPageSet() {
-      munmap(ht, count * sizeof(u64));
-   }
+   // void returnFramesToGlobalList(const std::vector<Page*> & list,  int maxToFree) {
+   //    int cpu_id = dune_get_cpu_id();
+   //    if ((slotMutexes[cpu_id].try_lock())) {
+   //       for (int i = list.size() - 1; i >= 0 && maxToFree--; --i) {
+   //          globalFreeLists[cpu_id].push_back(list[i]);
+   //       }
+   //       slotMutexes[cpu_id].unlock();
+   //       return;
+   //    }
+   //    retry:
+   //    u64 slot = last_stolen != -1 ? last_stolen : RandomGenerator::getRand(0, 1024) % kNumGlobalFreeLists;
+   //    if ((slotMutexes[slot].try_lock())) {
+   //       for (int i = list.size() - 1; i >= 0 && maxToFree--; --i) {
+   //          globalFreeLists[slot].push_back(list[i]);
+   //       }
+   //       last_stolen = slot;
+   //       slotMutexes[slot].unlock();
+   //    } else {
+   //       last_stolen = -1;
+   //       goto retry;
+   //    }
+   // }
 
-   u64 next_pow2(u64 x) {
-      return 1<<(64-__builtin_clzl(x-1));
-   }
-
-   u64 hash(u64 k) {
-      const u64 m = 0xc6a4a7935bd1e995;
-      const int r = 47;
-      u64 h = 0x8445d61a4e774912 ^ (8*m);
-      k *= m;
-      k ^= k >> r;
-      k *= m;
-      h ^= k;
-      h *= m;
-      h ^= h >> r;
-      h *= m;
-      h ^= h >> r;
-      return h;
-   }
-
-   void insert(u64 pid) {
-      u64 pos = hash(pid) & mask;
-      while (true) {
-         u64 curr = ht[pos].pid.load();
-         assert(curr != pid);
-         if ((curr == empty) || (curr == tombstone))
-            if (ht[pos].pid.compare_exchange_strong(curr, pid))
-               return;
-
-         pos = (pos + 1) & mask;
+   
+   FramesMemoryManager(Page* framesMem, u64 physCount): framesMem(framesMem), physCount(physCount), clockPos(0) {
+      for (u64 i=0; i < physCount; i++){
+         framesMem[i].state.init(kTabbyInvalidAddr);
+         freelists[i%kNumGlobalFreeLists].push(framesMem+i);
       }
    }
 
-   bool remove(u64 pid) {
-      u64 pos = hash(pid) & mask;
-      while (true) {
-         u64 curr = ht[pos].pid.load();
-         if (curr == empty)
-            return false;
-
-         if (curr == pid)
-            if (ht[pos].pid.compare_exchange_strong(curr, tombstone))
-               return true;
-
-         pos = (pos + 1) & mask;
+   bool steal_pages(vector<Page*> & container, int slot, int max_to_steal) {
+      assert(container.empty());
+      int cpu_id = dune_get_cpu_id();
+      // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+      //    dune_printf("cpu_id %d acquired mutex %p steal_pages 1\n", cpu_id, &freelists[cpu_id].mtx);		
+      // }
+      if (freelists[slot].mtx.try_lock()) { // Fail if the mutex is locked to avoid contention
+         // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+         //    dune_printf("cpu_id %d acquired mutex %p steal_pages 2\n", cpu_id, &freelists[cpu_id].mtx);		
+         // }
+         while (freelists[slot].list.size() > 0 && max_to_steal--) {
+            container.push_back(freelists[slot].pop());
+         }
+         freelists[slot].mtx.unlock();
+         return container.empty() == false;
       }
+      return false;
+   }
+
+   Page* allocFrame() {
+      int cpu_id = dune_get_cpu_id();
+      // if (cpu_id >= kNumGlobalFreeLists) {
+      //    cerr << "cpu_id " << cpu_id << " >= kNumGlobalFreeLists " << kNumGlobalFreeLists << endl; 
+      // }
+      assert(cpu_id < kNumGlobalFreeLists);
+      // try local list
+      if (freelists[cpu_id].count > 0) {
+         // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+         //    dune_printf("cpu_id %d acquired mutex %p allocFrame 31\n", cpu_id, &freelists[cpu_id].mtx);		
+         // }
+         // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
+         std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
+         // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+         //    dune_printf("cpu_id %d acquired mutex %p allocFrame 32\n", cpu_id, &freelists[cpu_id].mtx);		
+         // }
+         if (freelists[cpu_id].count > 0) {
+            Page * p = freelists[cpu_id].pop();
+            return p;
+         }
+      }
+
+      std::vector<Page*> container;
+      container.reserve(kLocalFreeListSoftLimit);
+      // try last place we stole from
+      if (last_stolen != -1 && freelists[last_stolen].count > 0) {
+         if (steal_pages(container, last_stolen, kLocalFreeListSoftLimit)) {
+            assert(container.empty() == false);
+            // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+            //    dune_printf("cpu_id %d acquired mutex %p  allocFrame 11\n", cpu_id, &freelists[cpu_id].mtx);		
+            // }
+            // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
+            std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
+            // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+            //    dune_printf("cpu_id %d acquired mutex %p  allocFrame 12\n", cpu_id, &freelists[cpu_id].mtx);		
+            // }
+            for (Page * p : container) {
+               freelists[cpu_id].push(p);
+            }
+            Page * p = freelists[cpu_id].pop();
+            return p;
+         }
+      }
+
+      last_stolen = -1;
+
+      // Power of two choices
+      while (last_stolen == -1) {
+         int slot1 = RandomGenerator::getRand(0, 1024) % kNumGlobalFreeLists;
+         int slot2 = RandomGenerator::getRand(0, 1024) % kNumGlobalFreeLists;
+         if (slot1 > slot2) {
+            std::swap(slot1, slot2);
+         }
+         int size1 = freelists[slot1].count;
+         int size2 = freelists[slot2].count;
+         int slot = size1 > size2 ? slot1: slot2;
+
+         if (steal_pages(container, slot, kLocalFreeListSoftLimit)) {
+            assert(container.empty() == false);
+            last_stolen = slot;
+            // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+            //    dune_printf("cpu_id %d acquired mutex %p allocFrame 21\n", cpu_id, &freelists[cpu_id].mtx);		
+            // }
+            // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
+            std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
+            // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+            //    dune_printf("cpu_id %d acquired mutex %p allocFrame 22\n", cpu_id, &freelists[cpu_id].mtx);		
+            // }
+            for (Page * p : container) {
+               freelists[cpu_id].push(p);
+            }
+            Page * p = freelists[cpu_id].pop();
+            return p;
+         }
+      }
+      assert(false);
+      return NULL;
+   }
+
+   void freeFrames(const std::vector<Page*> & pages) {
+      int cpu_id = dune_get_cpu_id();
+      // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+      //    dune_printf("cpu_id %d acquired mutex %p freeFrames 11, freeing %d pages\n", cpu_id, &freelists[cpu_id].mtx, pages.size());		
+      // }
+      // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
+      std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
+      for (Page * p : pages) {
+         freelists[cpu_id].push(p);
+      }
+      // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
+      //    dune_printf("cpu_id %d acquired mutex %p freeFrames 12, freed %d pages\n", cpu_id, &freelists[cpu_id].mtx, pages.size());		
+      // }
+   }
+
+   void freeFrame(Page* page) {
+      int cpu_id = dune_get_cpu_id();
+      // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
+      std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
+      freelists[cpu_id].push(page);
    }
 
    template<class Fn>
@@ -219,49 +687,17 @@ struct ResidentPageSet {
       u64 pos, newPos;
       do {
          pos = clockPos.load();
-         newPos = (pos+batch) % count;
+         newPos = (pos+batch) % physCount;
       } while (!clockPos.compare_exchange_strong(pos, newPos));
-
+      //pos = RandomGenerator::getRand<u64>(0, physCount);
       for (u64 i=0; i<batch; i++) {
-         u64 curr = ht[pos].pid.load();
-         if ((curr != tombstone) && (curr != empty))
-            fn(curr);
-         pos = (pos + 1) & mask;
+         fn(&framesMem[pos]);
+         pos = (pos + 1) % physCount;
       }
    }
 };
 
-// libaio interface used to write batches of pages
-struct LibaioInterface {
-   static const u64 maxIOs = 256;
-
-   int blockfd;
-   Page* virtMem;
-   io_context_t ctx;
-   iocb cb[maxIOs];
-   iocb* cbPtr[maxIOs];
-   io_event events[maxIOs];
-
-   LibaioInterface(int blockfd, Page* virtMem) : blockfd(blockfd), virtMem(virtMem) {
-      memset(&ctx, 0, sizeof(io_context_t));
-      if (io_setup(maxIOs, &ctx) != 0)
-         die("io_setup error");
-   }
-
-   void writePages(const vector<PID>& pages) {
-      assert(pages.size() < maxIOs);
-      for (u64 i=0; i<pages.size(); i++) {
-         PID pid = pages[i];
-         virtMem[pid].dirty = false;
-         cbPtr[i] = &cb[i];
-         io_prep_pwrite(cb+i, blockfd, &virtMem[pid], pageSize, pageSize*pid);
-      }
-      int cnt = io_submit(ctx, pages.size(), cbPtr);
-      assert(cnt == pages.size());
-      cnt = io_getevents(ctx, pages.size(), pages.size(), events, nullptr);
-      assert(cnt == pages.size());
-   }
-};
+thread_local int FramesMemoryManager::last_stolen = -1;
 
 struct BufferManager {
    static const u64 mb = 1024ull * 1024;
@@ -272,28 +708,36 @@ struct BufferManager {
    u64 physCount;
    struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
-
-   bool useExmap;
-   int blockfd;
-   int exmapfd;
+   //vector<IOUringInterface> iouringInterface;
+   std::vector<int> blockfds;
 
    atomic<u64> physUsedCount;
-   ResidentPageSet residentSet;
+   //ResidentPageSet residentSet;
    atomic<u64> allocCount;
 
    atomic<u64> readCount;
    atomic<u64> writeCount;
 
-   Page* virtMem;
-   PageState* pageState;
+   // virtual memmory address range that maps to the storage space
+   Page* virtMem; 
+   // virtual memory address range that maps to all the buffer frames. 
+   // This is mostly for ease of iterating over all the buffer frames 
+   // without using a auxilary data structures such as a hash map.
+   Page* framesMem; 
+   FramesMemoryManager * frameMemManager;
+   //PageState* pageState;
    u64 batch;
 
-   PageState& getPageState(PID pid) {
-      return pageState[pid];
+   VMPageState& getPageState(PID pid) {
+      //return pageState[pid];
+      //cerr << "getPageState pid " << pid << " page vm address " << &virtMem[pid] << endl;
+      return virtMem[pid].state;
    }
 
    BufferManager();
    ~BufferManager() {}
+
+   void init();
 
    Page* fixX(PID pid);
    void unfixX(PID pid);
@@ -306,7 +750,9 @@ struct BufferManager {
 
    void ensureFreePages();
    Page* allocPage();
+   void handlePageFault(uint64_t addr, bool pf, bool newpage);
    void handleFault(PID pid);
+   //void handlePageFault(uint64_t addr);
    void readPage(PID pid);
    void evict();
 };
@@ -343,25 +789,36 @@ struct GuardO {
 
    void init() {
       assert(pid != moved);
-      PageState& ps = bm->getPageState(pid);
+      //VMPageState& ps = bm->getPageState(pid);
+      u64 expectedVMAddress = reinterpret_cast<u64>(ptr);
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         u64 v = ps.stateAndVersion.load();
-         switch (PageState::getState(v)) {
-            case PageState::Marked: {
-               u64 newV = PageState::sameVersion(v, PageState::Unlocked);
-               if (ps.stateAndVersion.compare_exchange_weak(v, newV)) {
+         //u64 v = ps.stateAndVersion.load();
+         VMPageState& ps = bm->getPageState(pid); // This access could trigger page-fault handler
+         u64 v = ps.getWord(); 
+         if (VMPageState::getVMAddress(v) != expectedVMAddress) {
+            bm->handlePageFault(expectedVMAddress, false, false);
+            continue;
+         }
+         assert(VMPageState::getState(v) != VMPageState::Evicted);
+         switch (VMPageState::getState(v)) {
+            case VMPageState::Marked: {
+               u64 newV = VMPageState::sameVersion(VMPageState::getVMAddress(v), VMPageState::getVersion(v), VMPageState::Unlocked);
+               if (ps.vmAddrAndVersionAndState.compare_exchange_weak(v, newV)) {
                   version = newV;
                   return;
                }
                break;
             }
-            case PageState::Locked:
+            case VMPageState::Locked:
                break;
-            case PageState::Evicted:
-               if (ps.tryLockX(v)) {
-                  bm->handleFault(pid);
-                  bm->unfixX(pid);
-               }
+            // case PageState::Evicted:
+            //    if (ps.tryLockX(v)) {
+            //       bm->handleFault(pid);
+            //       bm->unfixX(pid);
+            //    }
+            //    break;
+            case VMPageState::Evicted:
+               assert(false);
                break;
             default:
                version = v;
@@ -391,16 +848,21 @@ struct GuardO {
 
    void checkVersionAndRestart() {
       if (pid != moved) {
-         PageState& ps = bm->getPageState(pid);
-         u64 stateAndVersion = ps.stateAndVersion.load();
+         u64 expectedVMAddress = reinterpret_cast<u64>(ptr);
+         VMPageState& ps = bm->getPageState(pid);
+         u64 stateAndVersion = ps.getWord();
          if (version == stateAndVersion) // fast path, nothing changed
             return;
-         if ((stateAndVersion<<8) == (version<<8)) { // same version
-            u64 state = PageState::getState(stateAndVersion);
-            if (state <= PageState::MaxShared)
+
+         //if ((stateAndVersion<<8) == (version<<8)) { // same version
+         if (VMPageState::getVMAddress(stateAndVersion) == expectedVMAddress &&
+             VMPageState::getVersion(stateAndVersion) == VMPageState::getVersion(version)) {
+            u64 state = VMPageState::getState(stateAndVersion);
+            if (state <= VMPageState::MaxShared)
                return; // ignore shared locks
-            if (state == PageState::Marked)
-               if (ps.stateAndVersion.compare_exchange_weak(stateAndVersion, PageState::sameVersion(stateAndVersion, PageState::Unlocked)))
+            if (state == VMPageState::Marked)
+               if (ps.vmAddrAndVersionAndState.compare_exchange_weak(stateAndVersion, 
+                  VMPageState::sameVersion(VMPageState::getVMAddress(stateAndVersion), VMPageState::getVersion(stateAndVersion), VMPageState::Unlocked)))
                   return; // mark cleared
          }
          if (std::uncaught_exceptions()==0)
@@ -442,13 +904,23 @@ struct GuardX {
 
    explicit GuardX(GuardO<T>&& other) {
       assert(other.pid != moved);
+      u64 expectedVMAddress = reinterpret_cast<u64>(other.ptr);
       for (u64 repeatCounter=0; ; repeatCounter++) {
-         PageState& ps = bm->getPageState(other.pid);
-         u64 stateAndVersion = ps.stateAndVersion;
-         if ((stateAndVersion<<8) != (other.version<<8))
+         //VMPageState& ps = bm->getPageState(other.pid);
+         // u64 stateAndVersion = ps.stateAndVersion;
+         VMPageState& ps = bm->getPageState(other.pid); // This access could trigger page-fault handler
+         u64 stateAndVersion = ps.getWord(); 
+         if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
+            bm->handlePageFault(expectedVMAddress, false, false);
+            continue;
+         }
+         // if ((stateAndVersion<<8) != (other.version<<8))
+         //    throw OLCRestartException();
+         if (VMPageState::getVersion(stateAndVersion) != VMPageState::getVersion(other.version))
             throw OLCRestartException();
-         u64 state = PageState::getState(stateAndVersion);
-         if ((state == PageState::Unlocked) || (state == PageState::Marked)) {
+         assert(VMPageState::getState(stateAndVersion) != VMPageState::Evicted);
+         u64 state = VMPageState::getState(stateAndVersion);
+         if ((state == VMPageState::Unlocked) || (state == VMPageState::Marked)) {
             if (ps.tryLockX(stateAndVersion)) {
                pid = other.pid;
                ptr = other.ptr;
@@ -482,6 +954,7 @@ struct GuardX {
 
    // destructor
    ~GuardX() {
+      //cerr << "GuardX destructor pid " << pid << endl;
       if (pid != moved)
          bm->unfixX(pid);
    }
@@ -504,7 +977,14 @@ struct AllocGuard : public GuardX<T> {
    template <typename ...Params>
    AllocGuard(Params&&... params) {
       GuardX<T>::ptr = reinterpret_cast<T*>(bm->allocPage());
+      T*p = GuardX<T>::ptr;
       new (GuardX<T>::ptr) T(std::forward<Params>(params)...);
+      p->state.init((u64)(p));
+      u64 stateAndVersion = p->state.getWord();
+      bool succ = p->state.tryLockX(stateAndVersion);
+      TABBY_ASSERT(succ);
+      TABBY_ASSERT(p->state.getState() == VMPageState::Locked);
+      p->dirty = true;
       GuardX<T>::pid = bm->toPID(GuardX<T>::ptr);
    }
 };
@@ -522,14 +1002,54 @@ struct GuardS {
 
    GuardS(GuardO<T>&& other) {
       assert(other.pid != moved);
-      if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
-         pid = other.pid;
-         ptr = other.ptr;
-         other.pid = moved;
-         other.ptr = nullptr;
-      } else {
-         throw OLCRestartException();
+      //cerr << "GuardS, pid " << other.pid << endl;
+      u64 expectedVMAddress = reinterpret_cast<u64>(other.ptr);
+      for (u64 repeatCounter=0; ; repeatCounter++) {
+         VMPageState& ps = bm->getPageState(other.pid); // This access could trigger page-fault handler
+         //cerr << "GuardS, pid &ps = " << &ps << endl;
+         u64 stateAndVersion = ps.getWord(); 
+         if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
+            bm->handlePageFault(expectedVMAddress, false, false);
+            continue;
+         }
+      
+         // if ((stateAndVersion<<8) != (other.version<<8))
+         //    throw OLCRestartException();
+         if (VMPageState::getVersion(stateAndVersion) != VMPageState::getVersion(other.version))
+            throw OLCRestartException();
+         assert(VMPageState::getState(stateAndVersion) != VMPageState::Evicted);
+         // u64 state = VMPageState::getState(stateAndVersion);
+         // if ((state == VMPageState::Unlocked) || (state == VMPageState::Marked)) {
+         //    if (ps.tryLockX(stateAndVersion)) {
+         //       pid = other.pid;
+         //       ptr = other.ptr;
+         //       ptr->dirty = true;
+         //       other.pid = moved;
+         //       other.ptr = nullptr;
+         //       return;
+         //    }
+         // }
+         if (ps.tryLockS(stateAndVersion)) { // XXX: optimize?
+            pid = other.pid;
+            ptr = other.ptr;
+            other.pid = moved;
+            other.ptr = nullptr;
+            return;
+         } else {
+            throw OLCRestartException();
+         }
+         yield(repeatCounter);
       }
+
+      // assert(other.pid != moved);
+      // if (bm->getPageState(other.pid).tryLockS(other.version)) { // XXX: optimize?
+      //    pid = other.pid;
+      //    ptr = other.ptr;
+      //    other.pid = moved;
+      //    other.ptr = nullptr;
+      // } else {
+      //    throw OLCRestartException();
+      // }
    }
 
    GuardS(GuardS&& other) {
@@ -583,112 +1103,239 @@ u64 envOr(const char* env, u64 value) {
    return value;
 }
 
-BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize), residentSet(physCount) {
+static int page_walk_fill(const void *arg, ptent_t *ptep, void *va) {
+   (*(u64*)arg)++;
+   *ptep = 0;
+   dune_flush_tlb_one((unsigned long)va);
+   return 0;
+}
+
+static int page_walk_fill(const void *arg, ptent_t *ptep, void *va, int create) {
+   (*(u64*)arg)++;
+   *ptep = 0;
+   dune_flush_tlb_one((unsigned long)va);
+   return 0;
+}
+
+// for string delimiter
+std::vector<std::string> split(std::string s, std::string delimiter) {
+    size_t pos_start = 0, pos_end, delim_len = delimiter.length();
+    std::string token;
+    std::vector<std::string> res;
+
+    while ((pos_end = s.find(delimiter, pos_start)) != std::string::npos) {
+        token = s.substr (pos_start, pos_end - pos_start);
+        pos_start = pos_end + delim_len;
+        res.push_back (token);
+    }
+
+    res.push_back (s.substr (pos_start));
+    return res;
+}
+
+BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envOr("PHYSGB", 4)*gb), virtCount(virtSize / pageSize), physCount(physSize / pageSize) {
    assert(virtSize>=physSize);
    const char* path = getenv("BLOCK") ? getenv("BLOCK") : "/tmp/bm";
-   blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
-   if (blockfd == -1) {
-      cerr << "cannot open BLOCK device '" << path << "'" << endl;
-      exit(EXIT_FAILURE);
+   std::vector<std::string> paths = split(path, ",");
+   //blockfd = open(path, O_RDWR | O_DIRECT, S_IRWXU);
+   for (size_t i = 0; i < paths.size(); ++i) {
+      int blockfd = open(paths[i].c_str(), O_RDWR | O_DIRECT, S_IRWXU);
+      if (blockfd == -1) {
+         cerr << "cannot open BLOCK device '" << paths[i] << "'" << endl;
+         exit(EXIT_FAILURE);
+      }
+      blockfds.push_back(blockfd);
    }
+   
    u64 virtAllocSize = virtSize + (1<<16); // we allocate 64KB extra to prevent segfaults during optimistic reads
 
-   useExmap = envOr("EXMAP", 0);
-   if (useExmap) {
-      exmapfd = open("/dev/exmap", O_RDWR);
-      if (exmapfd < 0) die("open exmap");
+   //virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+   //madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+   virtMem = (Page*)(kTabbyAddressSpaceStart);
 
-      struct exmap_ioctl_setup buffer;
-      buffer.fd             = blockfd;
-      buffer.max_interfaces = maxWorkerThreads;
-      buffer.buffer_size    = physCount;
-      buffer.flags          = 0;
-      if (ioctl(exmapfd, EXMAP_IOCTL_SETUP, &buffer) < 0)
-         die("ioctl: exmap_setup");
+   // Fill the page table entries with zero for pages between [kTabbyAddressSpaceStart, kTabbyAddressSpaceStart + virtAllocSize)
+   u64 counter = 0;
+   // dune_vm_page_walk_fill(pgroot, (void *) kTabbyAddressSpaceStart, (void*)(kTabbyAddressSpaceStart + virtAllocSize), page_walk_fill, &counter, CREATE_NORMAL);
+   dune_vm_page_walk_fill(pgroot, (void *) kTabbyAddressSpaceStart, (void*)(kTabbyAddressSpaceStart + virtAllocSize), page_walk_fill, &counter, CREATE_NORMAL);
 
-      for (unsigned i=0; i<maxWorkerThreads; i++) {
-         exmapInterface[i] = (struct exmap_user_interface *) mmap(NULL, pageSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, EXMAP_OFF_INTERFACE(i));
-         if (exmapInterface[i] == MAP_FAILED)
-            die("setup exmapInterface");
-      }
 
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-   } else {
-      virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
-   }
-
-   pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
-   for (u64 i=0; i<virtCount; i++)
-      pageState[i].init();
-   if (virtMem == MAP_FAILED)
-      die("mmap failed");
-
+   cerr << "virtMem " << (Page*)kTabbyAddressSpaceStart << ", initialized " << counter << " PTEs" << endl;
+   // pageState = (PageState*)allocHuge(virtCount * sizeof(PageState));
+   // for (u64 i=0; i<virtCount; i++)
+   //    pageState[i].init();
+   // if (virtMem == MAP_FAILED)
+   //    die("mmap failed");
+   auto nthreads = envOr("THREADS", 1);
    libaioInterface.reserve(maxWorkerThreads);
    for (unsigned i=0; i<maxWorkerThreads; i++)
-      libaioInterface.emplace_back(LibaioInterface(blockfd, virtMem));
-
+      libaioInterface.emplace_back(LibaioInterface(blockfds, virtMem));
+   // iouringInterface.reserve(maxWorkerThreads);
+   // for (unsigned i=0; i<nthreads; i++)
+   //    iouringInterface.emplace_back(IOUringInterface(blockfd, virtMem));
    physUsedCount = 0;
-   allocCount = 1; // pid 0 reserved for meta data
+   allocCount = 0; // pid 0 reserved for meta data
    readCount = 0;
    writeCount = 0;
+   //batch = envOr("BATCH", 128);
    batch = envOr("BATCH", 64);
 
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   cerr << "tabby " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << endl;
+
+   framesMem = (Page*)mmap(NULL, physSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_HUGETLB, -1, 0);
+   if (framesMem == MAP_FAILED) {
+      die("mmap failed");
+   }
+
+   cerr << "bm ptr " << bm << endl;
+
+   frameMemManager = new FramesMemoryManager(framesMem, physCount);
+   cerr << "framesMem " << framesMem << ", initialization finished" << endl;
+}
+
+void BufferManager::init() {
+   assert(allocCount.load() == 0);
+   AllocGuard<MetaDataPage> md;
+   //cerr << "Allocated metadata page at " << md.ptr << " state address " << (void*)&md->state << " vm address in state " << (void*)md->state.getVMAddress() << ", " << md->state.ToString() << endl;
+   assert(allocCount.load() == 1);
+
 }
 
 void BufferManager::ensureFreePages() {
-   if (physUsedCount >= physCount*0.95)
+   while (physUsedCount >= physCount*0.97)
       evict();
 }
 
-// allocated new page and fix it
+// allocate a new page and x-fix it
 Page* BufferManager::allocPage() {
-   physUsedCount++;
+   //cerr << "allocPage physUsedCount0 " <<endl;
+   //physUsedCount++;
+   //cerr << "allocPage physUsedCount1 " << physUsedCount <<endl;
    ensureFreePages();
+   //cerr << "allocPage physUsedCount2 " << physUsedCount <<endl;
    u64 pid = allocCount++;
+   //cerr << "allocPage pid allocated " << pid <<endl;
    if (pid >= virtCount) {
       cerr << "VIRTGB is too low" << endl;
       exit(EXIT_FAILURE);
    }
-   u64 stateAndVersion = getPageState(pid).stateAndVersion;
-   bool succ = getPageState(pid).tryLockX(stateAndVersion);
-   assert(succ);
-   residentSet.insert(pid);
+   handlePageFault((u64)(virtMem + pid), false, true);
+   Page* p = &virtMem[pid];
 
-   if (useExmap) {
-      exmapInterface[workerThreadId]->iov[0].page = pid;
-      exmapInterface[workerThreadId]->iov[0].len = 1;
-      while (exmapAction(exmapfd, EXMAP_OP_ALLOC, 1) < 0) {
-         cerr << "allocPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   }
-   virtMem[pid].dirty = true;
-
-   return virtMem + pid;
+   //cerr << "Return allocated page " << p << " state address " << &p->state << " " << p->state.ToString() <<endl;
+   return p;
 }
 
 void BufferManager::handleFault(PID pid) {
    physUsedCount++;
    ensureFreePages();
    readPage(pid);
-   residentSet.insert(pid);
+   //residentSet.insert(pid);
+}
+int hardware_page_faults = 0;
+void BufferManager::handlePageFault(uint64_t addr, bool pf, bool newpage) {
+   ensureFreePages();
+
+   //cerr << "handlePageFault at " << (void*)addr << " pf " << pf << " newpage " << newpage << endl;
+   uint64_t aligned_addr = addr & ~(4095);
+   TABBY_ASSERT(addr >= kTabbyAddressSpaceStart);
+   assert(aligned_addr >= kTabbyAddressSpaceStart);
+   ptent_t * pte;
+   ptent_t new_pte = 0;
+   int ret = 0;
+   {
+      ret = dune_vm_lookup(pgroot, (void *) addr, CREATE_NONE, &pte);
+      assert(!ret);
+   }
+   ptent_t old_pte = *pte;
+   PID pid = (aligned_addr - kTabbyAddressSpaceStart) / pageSize;
+   retry:
+   // Take the write lock using PTE_USR1 bit
+   if (!(old_pte & PTE_USR1) && std::atomic_ref(*pte).compare_exchange_strong(old_pte, old_pte | PTE_USR1)) {
+      if (pf) { // If page fault, present bit must not be set.
+         assert(!(*pte & PTE_P));
+         ++hardware_page_faults;
+      }
+      if (!(*pte & PTE_P)) {
+         assert(!(*pte & PTE_P));
+         // Allocate a physical frame.
+         Page * page = frameMemManager->allocFrame();
+         if (page == NULL) {
+            *pte = old_pte;
+            goto retry;
+         }
+         if (!newpage) {
+            //ret = pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
+            ret = libaioInterface[workerThreadId].pread(pid, page, pageSize);
+            //ret = iouringInterface[workerThreadId].pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
+            assert(ret==pageSize);
+            TABBY_ASSERT(page->state.getVMAddress() == aligned_addr);
+            TABBY_ASSERT(page->state.getState() == VMPageState::Locked);
+         }
+         new_pte = (PTE_FLAGS(old_pte) & (~PTE_USR1)) | PTE_P | PTE_W | PTE_ADDR(dune_va_to_pa((void *) page));
+         //cerr << "handlePageFault " << (Page*)addr << " " << pf << " " << newpage << " aligned_addr " << (Page*)aligned_addr << " got " << (Page*)page->state.getVMAddress() << " old pte " << (void*)*pte << " new pte " << (void*)new_pte<< " allocated page " << page << " paddr " << (void*)dune_va_to_pa((void *) page) << endl;
+         physUsedCount++;
+      } else {
+         dune_flush_tlb_one(aligned_addr);
+         assert(!pf);
+         // Page is present, check if it points to the correct physical frame.
+         if (((VMPageState*)(aligned_addr))->getVMAddress() == aligned_addr) {
+            new_pte = old_pte;
+         } else {
+            // Do an I/O read to bring in the correct page and update mapping
+            Page * page = frameMemManager->allocFrame();
+            if (page == NULL) {
+               *pte = old_pte;
+               goto retry;
+            }
+            TABBY_ASSERT(page->state.getVMAddress() == kTabbyInvalidAddr);
+            //ret = pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
+            //ret = iouringInterface[workerThreadId].pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
+            ret = libaioInterface[workerThreadId].pread(pid, page, pageSize);
+            TABBY_ASSERT(ret==pageSize);
+            if (page->state.getVMAddress() != aligned_addr) {
+               cerr << "handlePageFault " << (Page*)addr << " " << pf << " " << newpage << " aligned_addr " << (Page*)aligned_addr << " got " << (Page*)page->state.getVMAddress() << " *pte " << (void*)*pte << endl;
+               // using namespace backward;
+               // StackTrace st; st.load_here(32);
+               // Printer p; p.print(st);
+               exit(EXIT_FAILURE);
+            }
+            TABBY_ASSERT(page->state.getVMAddress() == aligned_addr);
+            TABBY_ASSERT(page->state.getState() == VMPageState::Locked);
+            page->state.unlockX();
+            new_pte = (PTE_FLAGS(old_pte) & (~PTE_USR1)) | PTE_P | PTE_W | PTE_ADDR(dune_va_to_pa((void *) page));
+            //new_pte |= PTE_P | PTE_W | PTE_A | PTE_U | PTE_ADDR(dune_va_to_pa((void *) page));
+            physUsedCount++;
+            readCount++;
+            //cerr << "handlePageFault " << (Page*)addr << " " << pf << " " << newpage << " aligned_addr " << (Page*)aligned_addr << " loaded frame " << (void *) page << endl;
+         }
+      }
+      std::atomic_ref(*pte).store(new_pte);
+   }
+   dune_flush_tlb_one(addr);
 }
 
 Page* BufferManager::fixX(PID pid) {
-   PageState& ps = getPageState(pid);
+   u64 expectedVMAddress = (u64)(virtMem + pid);
    for (u64 repeatCounter=0; ; repeatCounter++) {
-      u64 stateAndVersion = ps.stateAndVersion.load();
-      switch (PageState::getState(stateAndVersion)) {
-         case PageState::Evicted: {
-            if (ps.tryLockX(stateAndVersion)) {
-               handleFault(pid);
-               return virtMem + pid;
-            }
-            break;
-         }
-         case PageState::Marked: case PageState::Unlocked: {
+      VMPageState& ps = getPageState(pid); // This access could trigger page-fault handler
+      u64 stateAndVersion = ps.getWord(); 
+      if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
+         handlePageFault(expectedVMAddress, false, false);
+         continue;
+      }
+      assert(VMPageState::getState(stateAndVersion) != VMPageState::Evicted);
+      switch (VMPageState::getState(stateAndVersion)) {
+         // case PageState::Evicted: {
+         //    if (ps.tryLockX(stateAndVersion)) {
+         //       handleFault(pid);
+         //       return virtMem + pid;
+         //    }
+         //    break;
+         // }
+         case VMPageState::Evicted: // Impossible to be in Evicted state
+         assert(false);
+         break;
+         case VMPageState::Marked: case VMPageState::Unlocked: {
             if (ps.tryLockX(stateAndVersion))
                return virtMem + pid;
             break;
@@ -699,19 +1346,25 @@ Page* BufferManager::fixX(PID pid) {
 }
 
 Page* BufferManager::fixS(PID pid) {
-   PageState& ps = getPageState(pid);
+   u64 expectedVMAddress = (u64)(virtMem + pid);
    for (u64 repeatCounter=0; ; repeatCounter++) {
-      u64 stateAndVersion = ps.stateAndVersion;
-      switch (PageState::getState(stateAndVersion)) {
-         case PageState::Locked: {
+      VMPageState& ps = getPageState(pid); // This access could trigger page-fault handler
+      u64 stateAndVersion = ps.getWord(); 
+      if (VMPageState::getVMAddress(stateAndVersion) != expectedVMAddress) {
+         handlePageFault(expectedVMAddress, false, false);
+         continue;
+      }
+      switch (VMPageState::getState(stateAndVersion)) {
+         case VMPageState::Locked: {
             break;
-         } case PageState::Evicted: {
-            if (ps.tryLockX(stateAndVersion)) {
-               handleFault(pid);
-               ps.unlockX();
-            }
-            break;
-         }
+         } 
+         // case VMPageState::Evicted: {
+         //    if (ps.tryLockX(stateAndVersion)) {
+         //       handleFault(pid);
+         //       ps.unlockX();
+         //    }
+         //    break;
+         // }
          default: {
             if (ps.tryLockS(stateAndVersion))
                return virtMem + pid;
@@ -730,93 +1383,151 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-   if (useExmap) {
-      for (u64 repeatCounter=0; ; repeatCounter++) {
-         int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
-         if (ret == pageSize) {
-            assert(ret == pageSize);
-            readCount++;
-            return;
-         }
-         cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-         ensureFreePages();
-      }
-   } else {
-      int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-      assert(ret==pageSize);
-      readCount++;
-   }
+   // if (useExmap) {
+   //    for (u64 repeatCounter=0; ; repeatCounter++) {
+   //       int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
+   //       if (ret == pageSize) {
+   //          assert(ret == pageSize);
+   //          readCount++;
+   //          return;
+   //       }
+   //       cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
+   //       ensureFreePages();
+   //    }
+   // } else {
+   //int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
+   //assert(ret==pageSize);
+   readCount++;
+   //}
 }
 
+atomic<long> evict_rounds{0};
+atomic<long> evict_written_pages{0};
+atomic<long> evict_clean_pages{0};
 void BufferManager::evict() {
-   vector<PID> toEvict;
+   //cerr << "BufferManager::evict" << endl;
+   //vector<PID> toEvict;
+   vector<Page*> toEvict;
    toEvict.reserve(batch);
-   vector<PID> toWrite;
+   //vector<PID> toWrite;
+   vector<Page*> toWrite;
    toWrite.reserve(batch);
-
+   int loops = 0;
+   int toEvictSize = 0;
+   int toWriteSize = 0;
+   int shared = 0;
+   int locked = 0;
+   int total = 0;
    // 0. find candidates, lock dirty ones in shared mode
    while (toEvict.size()+toWrite.size() < batch) {
-      residentSet.iterateClockBatch(batch, [&](PID pid) {
-         PageState& ps = getPageState(pid);
-         u64 v = ps.stateAndVersion;
-         switch (PageState::getState(v)) {
-            case PageState::Marked:
-               if (virtMem[pid].dirty) {
-                  if (ps.tryLockS(v))
-                     toWrite.push_back(pid);
+      frameMemManager->iterateClockBatch(batch, [&](Page * page) {
+         total++;
+         VMPageState& ps = page->state;
+         u64 v = ps.getWord();
+         if (VMPageState::getVMAddress(v) == kTabbyInvalidAddr) // Skip free frames
+            return;
+         TABBY_ASSERT(VMPageState::getState(v) != VMPageState::Evicted);
+         switch (VMPageState::getState(v)) {
+            case VMPageState::Marked:
+               if (page->dirty) {
+                  if (ps.tryLockX(v))
+                     toWrite.push_back(page);
                } else {
-                  toEvict.push_back(pid);
+                  toEvict.push_back(page);
                }
                break;
-            case PageState::Unlocked:
+            case VMPageState::Unlocked:
                ps.tryMark(v);
                break;
+            case VMPageState::Locked:
+               ++locked;
+               break;
             default:
+               ++shared;
                break; // skip
          };
       });
+      ++loops;
+      if (loops > 100000) {
+         cerr << "evict scan failed to find enough pages physUsedCount " << physUsedCount << " physCount" << physCount << endl;
+         loops = 0;
+         // using namespace backward;
+         // StackTrace st; st.load_here(32);
+         // Printer p; p.print(st);
+      }
    }
 
+   //cerr << "evict scan found " << toWrite.size() << " dirty pages, " << toEvict.size() << " clean evictable pages" << endl;
    // 1. write dirty pages
    libaioInterface[workerThreadId].writePages(toWrite);
    writeCount += toWrite.size();
 
+   toEvictSize = toEvict.size();
+   toWriteSize = toWrite.size();
    // 2. try to lock clean page candidates
-   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](PID pid) {
-      PageState& ps = getPageState(pid);
-      u64 v = ps.stateAndVersion;
-      return (PageState::getState(v) != PageState::Marked) || !ps.tryLockX(v);
+   toEvict.erase(std::remove_if(toEvict.begin(), toEvict.end(), [&](Page * page) {
+      VMPageState& ps = page->state;
+      u64 v = ps.getWord();
+      return (VMPageState::getState(v) != VMPageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
+   
 
+   // for (Page* page : toEvict) {
+   //    VMPageState& ps = page->state;
+   //    u64 v = ps.getWord();
+   //    assert(VMPageState::getState(v) == VMPageState::Locked);
+   //    assert(VMPageState::getVMAddress(v) != kTabbyInvalidAddr);
+   //    ps.unlockXInvalidated();
+   //    //frameMemManager->freeFrame(page);
+   // }
+   // if (toEvict.empty() == false) {
+   //    frameMemManager->freeFrames(toEvict);
+   //    toEvict.clear();
+   // }
+
+   //physUsedCount -= toEvict.size();
+
+   evict_clean_pages += toEvict.size();
+   //toEvict.clear();
+
+   evict_written_pages += toWrite.size();
+   evict_rounds += 1;
+   //toEvict = toWrite;
+   toEvict.insert(toEvict.end(), toWrite.begin(), toWrite.end());
    // 3. try to upgrade lock for dirty page candidates
-   for (auto& pid : toWrite) {
-      PageState& ps = getPageState(pid);
-      u64 v = ps.stateAndVersion;
-      if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-         toEvict.push_back(pid);
-      else
-         ps.unlockS();
-   }
+   // for (auto& pid : toWrite) {
+   //    PageState& ps = getPageState(pid);
+   //    u64 v = ps.stateAndVersion;
+   //    if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
+   //       toEvict.push_back(pid);
+   //    else
+   //       ps.unlockS();
+   // }
 
    // 4. remove from page table
-   if (useExmap) {
-      for (u64 i=0; i<toEvict.size(); i++) {
-         exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-         exmapInterface[workerThreadId]->iov[i].len = 1;
-      }
-      if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
-         die("ioctl: EXMAP_OP_FREE");
-   } else {
-      for (u64& pid : toEvict)
-         madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-   }
+   // if (useExmap) {
+   //    for (u64 i=0; i<toEvict.size(); i++) {
+   //       exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
+   //       exmapInterface[workerThreadId]->iov[i].len = 1;
+   //    }
+   //    if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
+   //       die("ioctl: EXMAP_OP_FREE");
+   // } else {
+   // for (u64& pid : toEvict)
+   //    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
+   //}
 
    // 5. remove from hash table and unlock
-   for (u64& pid : toEvict) {
-      bool succ = residentSet.remove(pid);
-      assert(succ);
-      getPageState(pid).unlockXEvicted();
+   for (Page* page : toEvict) {
+      VMPageState& ps = page->state;
+      u64 v = ps.getWord();
+      assert(VMPageState::getState(v) == VMPageState::Locked);
+      assert(VMPageState::getVMAddress(v) != kTabbyInvalidAddr);
+      ps.unlockXInvalidated();
+      //frameMemManager->freeFrame(page);
    }
+   frameMemManager->freeFrames(toEvict);
+   //cerr << "evicted " << toEvict.size() << " toEvictSize " << toEvictSize << " toWriteSize " << toWriteSize << " shared " << shared << " locked " << locked << " scanned " << total << " physUsedCount " << physUsedCount << endl;
 
    physUsedCount -= toEvict.size();
 }
@@ -826,14 +1537,14 @@ void BufferManager::evict() {
 struct BTreeNode;
 
 struct BTreeNodeHeader {
-   static const unsigned underFullSize = pageSize / 4;  // merge nodes below this size
+   static const unsigned underFullSize = (pageSize/2) + (pageSize/4);  // merge nodes more empty
    static const u64 noNeighbour = ~0ull;
 
    struct FenceKeySlot {
       u16 offset;
       u16 len;
    };
-
+   VMPageState state;
    bool dirty;
    union {
       PID upperInnerNode; // inner
@@ -1290,15 +2001,6 @@ struct BTreeNode : public BTreeNodeHeader {
 
 static_assert(sizeof(BTreeNode) == pageSize, "btree node size problem");
 
-static const u64 metadataPageId = 0;
-
-struct MetaDataPage {
-   bool dirty;
-   PID roots[(pageSize-8)/8];
-
-   PID getRoot(unsigned slot) { return roots[slot]; }
-};
-
 struct BTree {
    private:
 
@@ -1442,6 +2144,7 @@ BTree::BTree() : splitOrdered(false) {
    AllocGuard<BTreeNode> rootNode(true);
    slotId = btreeslotcounter++;
    page->roots[slotId] = rootNode.pid;
+   cerr << "BTree root allocated at slot " << slotId  << " pid " << rootNode.pid << " " << rootNode.ptr << " count " << rootNode->count << " isLeaf " << rootNode->isLeaf << endl;
 }
 
 BTree::~BTree() {}
@@ -1506,22 +2209,27 @@ void BTree::insert(span<u8> key, span<u8> payload)
          GuardO<BTreeNode> parent(metadataPageId);
          GuardO<BTreeNode> node(reinterpret_cast<MetaDataPage*>(parent.ptr)->getRoot(slotId), parent);
 
+         //cerr << "BTree::insert descending started at " << node.ptr << " " << node->isInner() << node->count << endl;
          while (node->isInner()) {
             parent = move(node);
             node = GuardO<BTreeNode>(parent->lookupInner(key), parent);
          }
-
+         //cerr << "BTree::insert descending ended" << endl;
          if (node->hasSpaceFor(key.size(), payload.size())) {
             // only lock leaf
+            //cerr << "BTree::insert locking leaf" << endl;
             GuardX<BTreeNode> nodeLocked(move(node));
+            //cerr << "BTree::insert locked leaf" << endl;
             parent.release();
             nodeLocked->insertInPage(key, payload);
             return; // success
          }
 
          // lock parent and leaf
+         //cerr << "BTree::insert locking leaf and parent" << endl;
          GuardX<BTreeNode> parentLocked(move(parent));
          GuardX<BTreeNode> nodeLocked(move(node));
+         //cerr << "BTree::insert locked leaf and parent" << endl;
          trySplit(move(nodeLocked), move(parentLocked), key, payload.size());
          // insert hasn't happened, restart from root
       } catch(const OLCRestartException&) {}
@@ -1570,17 +2278,6 @@ bool BTree::remove(span<u8> key)
 }
 
 typedef u64 KeyType;
-
-void handleSEGFAULT(int signo, siginfo_t* info, void* extra) {
-   void* page = info->si_addr;
-   if (bm->isValidPtr(page)) {
-      cerr << "segfault restart " << bm->toPID(page) << endl;
-      throw OLCRestartException();
-   } else {
-      cerr << "segfault " << page << endl;
-      _exit(1);
-   }
-}
 
 template <class Record>
 struct vmcacheAdapter
@@ -1693,31 +2390,25 @@ pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
    bool nonpresent = (fec & FEC_P) == 0;
    bool protection = fec & FEC_P;
    bool write = fec & FEC_W;
-	// if (was_user) {
-  //   ret = dune_vm_lookup(pgroot, (void *) addr, nonpresent ? CREATE_NORMAL, &pte);
-	// 	assert(!ret);
-  //   if (nonpresent) {
-  //     *pte |= PTE_W | PTE_ADDR(dune_va_to_pa((void *) addr));
-  //   }
-  //    |= PTE_U | PTE_P | PTE_W | PTE_ADDR(dune_va_to_pa((void *) addr));
-  //   //dune_flush_tlb_one(addr);
-	// } else {
-		/* XXX use mem lock */
    bool created = false;
+   if (addr >= kTabbyAddressSpaceStart) {
+      bm->handlePageFault(addr, true, false);
+      return;
+   }
    ret = dune_vm_lookup2(pgroot, (void *) addr, CREATE_NORMAL, &created, &pte);
    assert(!ret);
    *pte |= PTE_U | PTE_P | PTE_W;// | PTE_ADDR(dune_va_to_pa((void *) addr)
    if (created) {
-   dune_printf("physical page created for vm %lx\n", addr);
+      dune_printf("physical page created for vm %lx\n", addr);
    }
    ++pgflt_count;
-	//}
 }
 
 #define USER_FUNC_1 668
 typedef void (*user_func_t)(void* arg);
 static void syscall_handler(struct dune_tf *tf)
 {
+   assert(false);
   int syscall_num = (int) tf->rax;
 
    ++pgflt_count;
@@ -1731,6 +2422,162 @@ static void syscall_handler(struct dune_tf *tf)
     dune_passthrough_syscall(tf);
   }
 }
+
+int num_cores = 0;
+
+int stick_this_thread_to_core(int core_id) {
+   core_id = core_id % num_cores;
+   cpu_set_t cpuset;
+   CPU_ZERO(&cpuset);
+   CPU_SET(core_id, &cpuset);
+
+   pthread_t current_thread = pthread_self();    
+   return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+}
+
+class ThreadPool {
+public:
+   static constexpr u64 MAX_WORKER_THREADS = 256;
+   // -------------------------------------------------------------------------------------
+   std::atomic<u64> running_threads = 0;
+   std::atomic<bool> keep_running = true;
+   // -------------------------------------------------------------------------------------
+   struct WorkerThread {
+      std::mutex mutex;
+      std::condition_variable cv;
+      std::function<void()> job;
+      bool wt_ready = true;   // Idle
+      bool job_set = false;   // Has job
+      bool job_done = false;  // Job done
+   };
+   std::vector<std::thread> worker_threads;
+   WorkerThread worker_threads_meta[MAX_WORKER_THREADS];
+   u32 workers_count;
+   ThreadPool(int workers) {
+      workers_count = workers;
+      assert(workers_count < MAX_WORKER_THREADS);
+      // -------------------------------------------------------------------------------------
+      worker_threads.reserve(workers_count);
+      for (u64 t_i = 0; t_i < workers_count; t_i++) {
+         worker_threads.emplace_back([&, t_i]() {
+            stick_this_thread_to_core(t_i);
+            #ifdef ENABLE_DUNE
+            if (dune_enter()) {
+               printf("failed to enter dune mode\n");
+               exit(1);
+            }
+            #endif
+            dune_set_cpu_id(t_i);
+            // -------------------------------------------------------------------------------------
+            running_threads++;
+            while (running_threads != (workers_count))
+               ;
+            auto& meta = worker_threads_meta[t_i];
+            //cerr << "Worker thread " << t_i << " mutex addr " << &meta.mutex << endl;
+            while (keep_running) {
+               std::unique_lock guard(meta.mutex);
+               meta.cv.wait(guard, [&]() { return keep_running == false || meta.job_set; });
+               if (!keep_running) {
+                  break;
+               }
+               meta.wt_ready = false;
+               meta.job();
+               meta.wt_ready = true;
+               meta.job_done = true;
+               meta.job_set = false;
+               meta.cv.notify_one();
+            }
+            running_threads--;
+         });
+      }
+      for (auto& t : worker_threads) {
+         t.detach();
+      }
+      // -------------------------------------------------------------------------------------
+      // Wait until all worker threads are initialized
+      while (running_threads < workers_count) {
+      }
+   }
+
+   // -------------------------------------------------------------------------------------
+   void scheduleJobSync(u64 t_i, std::function<void()> job)
+   {
+      setJob(t_i, job);
+      joinOne(t_i, [&](WorkerThread& meta) { return meta.job_done; });
+   }
+   // -------------------------------------------------------------------------------------
+   void scheduleJobAsync(u64 t_i, std::function<void()> job)
+   {
+      setJob(t_i, job);
+   }
+   // -------------------------------------------------------------------------------------
+   void scheduleJobs(u64 workers, std::function<void()> job)
+   {
+      for (u32 t_i = 0; t_i < workers; t_i++) {
+         setJob(t_i, job);
+      }
+   }
+   void scheduleJobs(u64 workers, std::function<void(u64 t_i)> job)
+   {
+      for (u32 t_i = 0; t_i < workers; t_i++) {
+         setJob(t_i, [=]() { return job(t_i); });
+      }
+   }
+
+   // -------------------------------------------------------------------------------------
+   void joinAll()
+   {
+      for (u32 t_i = 0; t_i < workers_count; t_i++) {
+         joinOne(t_i, [&](WorkerThread& meta) { return meta.wt_ready && !meta.job_set; });
+      }
+   }
+   // -------------------------------------------------------------------------------------
+   void setJob(u64 t_i, std::function<void()> job)
+   {
+      assert(t_i < workers_count);
+      auto& meta = worker_threads_meta[t_i];
+      std::unique_lock guard(meta.mutex);
+      meta.cv.wait(guard, [&]() { return !meta.job_set && meta.wt_ready; });
+      meta.job_set = true;
+      meta.job_done = false;
+      meta.job = job;
+      guard.unlock();
+      meta.cv.notify_one();
+   }
+   // -------------------------------------------------------------------------------------
+   void joinOne(u64 t_i, std::function<bool(WorkerThread&)> condition)
+   {
+      assert(t_i < workers_count);
+      auto& meta = worker_threads_meta[t_i];
+      std::unique_lock guard(meta.mutex);
+      meta.cv.wait(guard, [&]() { return condition(meta); });
+   }
+
+   ~ThreadPool()
+   {
+      keep_running = false;
+      for (u64 t_i = 0; t_i < workers_count; t_i++) {
+         worker_threads_meta[t_i].cv.notify_one();
+      }
+      while (running_threads) {
+      }
+   }
+
+   template<class Fn>
+   void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
+      uint64_t n = end-begin;
+      if (n<nthreads)
+         nthreads = n;
+      uint64_t perThread = n/nthreads;
+      for (unsigned i=0; i<nthreads; i++) {
+         scheduleJobAsync(i, [&,i]() {
+            uint64_t b = (perThread*i) + begin;
+            uint64_t e = (i==(nthreads-1)) ? end : ((b+perThread) + begin);
+            fn(i, b, e);
+         });
+      }
+   }
+};
 
 template<class Fn>
 void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
@@ -1751,31 +2598,26 @@ void parallel_for(uint64_t begin, uint64_t end, uint64_t nthreads, Fn fn) {
 }
 
 int main(int argc, char** argv) {
+   exception_hack::init_phdr_cache();
+   num_cores = sysconf(_SC_NPROCESSORS_ONLN);
    #ifdef ENABLE_DUNE
    int ret = dune_init_and_enter();
    if (ret) {
       cerr << "failed to initialize dune" << endl;
       exit(1);
    } else {
-      cerr << "entered dune-mode" << endl;
+      cerr << "entered dune-mode, num_cores " << num_cores << endl;
    }
    dune_register_syscall_handler(syscall_handler);
    dune_register_pgflt_handler(pgflt_handler);
-   dune_procmap_dump();
    #endif
-
+   dune_set_cpu_id(0);
    bm = new BufferManager();
-   if (bm->useExmap) {
-      struct sigaction action;
-      action.sa_flags = SA_SIGINFO;
-      action.sa_sigaction = handleSEGFAULT;
-      if (sigaction(SIGSEGV, &action, NULL) == -1) {
-         perror("sigusr: sigaction");
-         exit(1);
-      }
-   }
+   bm->init();
 
    unsigned nthreads = envOr("THREADS", 1);
+   ThreadPool pool(nthreads);
+
    u64 n = envOr("DATASIZE", 10);
    u64 runForSec = envOr("RUNFOR", 30);
    bool isRndread = envOr("RNDREAD", 0);
@@ -1783,140 +2625,130 @@ int main(int argc, char** argv) {
    u64 statDiff = 1e8;
    atomic<u64> txProgress(0);
    atomic<bool> keepRunning(true);
-   auto systemName = bm->useExmap ? "exmap" : "tabby";
+   auto systemName = "tabby";
+   u64 txnUpperBound = envOr("txnUpperBound", 1000000000);
 
    auto statFn = [&]() {
-      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch" << endl;
+      cout << "ts,tx,rmb,wmb,system,threads,datasize,workload,batch,phy_cnt" << endl;
       u64 cnt = 0;
       for (uint64_t i=0; i<runForSec; i++) {
          sleep(1);
          float rmb = (bm->readCount.exchange(0)*pageSize)/(1024.0*1024);
          float wmb = (bm->writeCount.exchange(0)*pageSize)/(1024.0*1024);
          u64 prog = txProgress.exchange(0);
-         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << endl;
+         cout << cnt++ << "," << prog << "," << rmb << "," << wmb << "," << systemName << "," << nthreads << "," << n << "," << (isRndread?"rndread":"tpcc") << "," << bm->batch << "," << bm->physUsedCount.load() << endl;
       }
       keepRunning = false;
+      cerr << "Benchmark finished " << endl;
+      cerr << "pgflt count " << pgflt_count << " hardware_page fault on tabby area " << hardware_page_faults << endl;
+      cerr << "evict_written_pages " << evict_written_pages << " evict_rounds " << evict_rounds <<  " write-batch size " << evict_written_pages / evict_rounds <<  endl;
+      cerr << "evict_clean_pages " << evict_clean_pages << " evict_rounds " << evict_rounds <<  " clean-batch size " << evict_clean_pages / evict_rounds <<  endl;
+      //sleep(1000);
+      cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
+      exit(0);
    };
+   
+   cerr << "BufferManager inited isRndread " << isRndread << endl;
 
    if (isRndread) {
+      u64 readRatio = envOr("READRATIO", 100);
+      bool isZipfian = envOr("zipfian", 0);
+      double theta = getenv("theta") ? atof(getenv("theta")) : 0.0;
+      cerr << "random lookup" << endl;
       BTree bt;
       bt.splitOrdered = true;
-      std::map<u64, array<u8,120>> mp;
-      // {
-      //    // insert
-      //    parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      //       #ifdef ENABLE_DUNE
-      //       if (dune_enter()) {
-      //          printf("failed to enter dune mode\n");
-      //          exit(1);
-      //       }
-      //       #endif
-      //       workerThreadId = worker;
-      //       array<u8, 120> payload;
-      //       for (u64 i=begin; i<end; i++) {
-      //          union { u64 v1; u8 k1[sizeof(u64)]; };
-      //          v1 = __builtin_bswap64(i);
-      //          memcpy(payload.data(), k1, sizeof(u64));
-      //          //bt.insert({k1, sizeof(KeyType)}, payload);
-      //          mp[v1] = payload;
-      //       }
-      //    });
-      // }
-      array<u8, 120> payload;
-      for (u64 i=0; i<n; i++) {
-         union { u64 v1; u8 k1[sizeof(u64)]; };
-         v1 = __builtin_bswap64(i);
-         memcpy(payload.data(), k1, sizeof(u64));
-         //bt.insert({k1, sizeof(KeyType)}, payload);
-         mp[v1] = payload;
+      {
+         // insert
+         pool.parallel_for(0, n, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+            
+            //cerr << "insert worker " << worker  << " entered dune-mode" << endl;
+            workerThreadId = worker;
+            array<u8, 120> payload;
+            for (u64 i=begin; i<end; i++) {
+               union { u64 v1; u8 k1[sizeof(u64)]; };
+               v1 = __builtin_bswap64(i);
+               memcpy(payload.data(), k1, sizeof(u64));
+               bt.insert({k1, sizeof(KeyType)}, payload);
+               if (i % 10000000 == 0) {
+                  cerr << "loaded " << i << endl;
+               }
+            }
+            //cerr << "insert worker " << worker  << " finished" << endl;
+         });
+         pool.joinAll();
       }
+   
       cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
+      cerr << "theta " << theta << endl;
 
       bm->readCount = 0;
       bm->writeCount = 0;
+      
+      ScrambledZipfGenerator generator = ScrambledZipfGenerator(0, n, theta);
       thread statThread(statFn);
 
-      // parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
-      //    workerThreadId = worker;
-      //    u64 cnt = 0;
-      //    u64 start = rdtsc();
-      //    // #ifdef ENABLE_DUNE
-      //    // if (dune_enter()) {
-      //    //    printf("failed to enter dune mode\n");
-      //    //    exit(1);
-      //    // }
-      //    // #endif
-      //    while (keepRunning.load()) {
-      //       union { u64 v1; u8 k1[sizeof(u64)]; };
-      //       v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+      pool.parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+         workerThreadId = worker;
+         u64 cnt = 0;
+         u64 start = rdtsc();
 
-      //       array<u8, 120> payload;
-      //       payload = mp[v1];
-      //       // bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-      //       //    memcpy(payload.data(), p.data(), p.size());
-      //       // });
-      //       // assert(succ);
-      //       assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+         while (keepRunning.load()) {
+            union { u64 v1; u8 k1[sizeof(u64)]; };
+            if (!isZipfian) {
+               v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            }
+            else {
+               v1 = __builtin_bswap64(generator.rand());
+            }
 
-      //       cnt++;
-      //       u64 stop = rdtsc();
-      //       if ((stop-start) > statDiff) {
-      //          txProgress += cnt;
-      //          start = stop;
-      //          cnt = 0;
-      //       }
-      //    }
-      //    txProgress += cnt;
-      // });
-      u64 cnt = 0;
-      u64 start = rdtsc();
-      while (keepRunning.load()) {
-         union { u64 v1; u8 k1[sizeof(u64)]; };
-         v1 = __builtin_bswap64(RandomGenerator::getRand<u64>(0, n));
+            array<u8, 120> payload;
 
-         array<u8, 120> payload;
-         payload = mp[v1];
-         // bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
-         //    memcpy(payload.data(), p.data(), p.size());
-         // });
-         // assert(succ);
-         assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            if (readRatio == 100 || RandomGenerator::getRand<u64>(0, 100) < readRatio) {
+               bool succ = bt.lookup({k1, sizeof(u64)}, [&](span<u8> p) {
+                  memcpy(payload.data(), p.data(), p.size());
+               });
+               assert(succ);
+               //assert(memcmp(k1, payload.data(), sizeof(u64))==0);
+            } else {
+               RandomGenerator::getRandString(reinterpret_cast<u8*>(payload.data()), sizeof(u8) * 120);
+               //bt.insert({k1, sizeof(KeyType)}, payload);
+               bt.updateInPlace({k1, sizeof(u64)}, [&](span<u8> payload_buf) {
+                  memcpy(payload_buf.data(), payload.data(), payload.size());
+                  //fn(*reinterpret_cast<Record*>(payload.data()));
+               });
+            }
 
-         cnt++;
-         u64 stop = rdtsc();
-         if ((stop-start) > statDiff) {
-            txProgress += cnt;
-            start = stop;
-            cnt = 0;
+            cnt++;
+            u64 stop = rdtsc();
+            if ((stop-start) > statDiff) {
+               txProgress += cnt;
+               start = stop;
+               cnt = 0;
+            }
          }
-      }
-      txProgress += cnt;
+         txProgress += cnt;
+      });
+      pool.joinAll();
       statThread.join();
       cerr << "pgflt count " << pgflt_count << endl;
-      dune_procmap_dump();
+      //dune_procmap_dump();
       return 0;
    }
 
+   cerr << "TPC-C" << endl;
    // TPC-C
    Integer warehouseCount = n;
-
    vmcacheAdapter<warehouse_t> warehouse;
    vmcacheAdapter<district_t> district;
    vmcacheAdapter<customer_t> customer;
-   customer.tree.splitOrdered = true;
    vmcacheAdapter<customer_wdl_t> customerwdl;
    vmcacheAdapter<history_t> history;
-   history.tree.splitOrdered = true;
    vmcacheAdapter<neworder_t> neworder;
    vmcacheAdapter<order_t> order;
-   order.tree.splitOrdered = true;
    vmcacheAdapter<order_wdc_t> order_wdc;
    vmcacheAdapter<orderline_t> orderline;
-   orderline.tree.splitOrdered = true;
    vmcacheAdapter<item_t> item;
-   item.tree.splitOrdered = true;
    vmcacheAdapter<stock_t> stock;
-   stock.tree.splitOrdered = true;
 
    TPCCWorkload<vmcacheAdapter> tpcc(warehouse, district, customer, customerwdl, history, neworder, order, order_wdc, orderline, item, stock, true, warehouseCount, true);
 
@@ -1924,7 +2756,7 @@ int main(int argc, char** argv) {
       tpcc.loadItem();
       tpcc.loadWarehouse();
 
-      parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+      pool.parallel_for(1, warehouseCount+1, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
          workerThreadId = worker;
          for (Integer w_id=begin; w_id<end; w_id++) {
             tpcc.loadStock(w_id);
@@ -1935,27 +2767,27 @@ int main(int argc, char** argv) {
             }
          }
       });
+      pool.joinAll();
    }
+   evict_rounds = 0;
+   evict_written_pages = 0;
+   evict_clean_pages = 0;
    cerr << "space: " << (bm->allocCount.load()*pageSize)/(float)bm->gb << " GB " << endl;
 
    bm->readCount = 0;
    bm->writeCount = 0;
    thread statThread(statFn);
 
-   parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
+   pool.parallel_for(0, nthreads, nthreads, [&](uint64_t worker, uint64_t begin, uint64_t end) {
       workerThreadId = worker;
       u64 cnt = 0;
+      u64 timeCnt = 0;
       u64 start = rdtsc();
-      #ifdef ENABLE_DUNE
-      if (dune_enter()) {
-         printf("failed to enter dune mode\n");
-         exit(1);
-      }
-      #endif
       while (keepRunning.load()) {
          int w_id = tpcc.urand(1, warehouseCount); // wh crossing
          tpcc.tx(w_id);
          cnt++;
+         timeCnt++;
          u64 stop = rdtsc();
          if ((stop-start) > statDiff) {
             txProgress += cnt;
