@@ -497,9 +497,14 @@ struct LibaioInterface {
 //    }
 // };
 
-static constexpr u64 kNumGlobalFreeLists = 64;
+#ifndef TABBY_ALLOCATOR_STRIPED_LOCK  // Whether to enable stripped locks optimization
 static constexpr u64 kLocalFreeListSoftLimit = 64;
-static constexpr u64 kLocalFreeListHardLimit = 80;
+static constexpr u64 kNumGlobalFreeLists = 1;
+#else
+static constexpr u64 kLocalFreeListSoftLimit = 64;
+static constexpr u64 kNumGlobalFreeLists = 64;
+#endif
+
 struct FramesMemoryManager {
    Page* framesMem;
    u64 physCount;
@@ -527,9 +532,11 @@ struct FramesMemoryManager {
       }
    };
    FreeList freelists[kNumGlobalFreeLists];
-
    // thread_local static FreeList freelist;
    thread_local static int last_stolen;
+
+
+   std::mutex manager_mtx;
 
    // void returnFramesToGlobalList(const std::vector<Page*> & list,  int maxToFree) {
    //    int cpu_id = dune_get_cpu_id();
@@ -564,7 +571,7 @@ struct FramesMemoryManager {
 
    bool steal_pages(vector<Page*> & container, int slot, int max_to_steal) {
       assert(container.empty());
-      int cpu_id = dune_get_cpu_id();
+      int cpu_id = dune_get_cpu_id() % kNumGlobalFreeLists;
       // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
       //    dune_printf("cpu_id %d acquired mutex %p steal_pages 1\n", cpu_id, &freelists[cpu_id].mtx);		
       // }
@@ -582,10 +589,13 @@ struct FramesMemoryManager {
    }
 
    Page* allocFrame() {
-      int cpu_id = dune_get_cpu_id();
+      int cpu_id = dune_get_cpu_id() % kNumGlobalFreeLists;
       // if (cpu_id >= kNumGlobalFreeLists) {
       //    cerr << "cpu_id " << cpu_id << " >= kNumGlobalFreeLists " << kNumGlobalFreeLists << endl; 
       // }
+      // #ifndef TABBY_ALLOCATOR_STRIPED_LOCK  // Whether to enable stripped locks optimization
+      // std::unique_lock<std::mutex> gg(manager_mtx);
+      // #endif
       assert(cpu_id < kNumGlobalFreeLists);
       // try local list
       if (freelists[cpu_id].count > 0) {
@@ -602,7 +612,11 @@ struct FramesMemoryManager {
             return p;
          }
       }
-
+      
+      if (kNumGlobalFreeLists == 1) {
+         assert(false);
+         return NULL;
+      }
       std::vector<Page*> container;
       container.reserve(kLocalFreeListSoftLimit);
       // try last place we stole from
@@ -661,7 +675,10 @@ struct FramesMemoryManager {
    }
 
    void freeFrames(const std::vector<Page*> & pages) {
-      int cpu_id = dune_get_cpu_id();
+      // #ifndef TABBY_ALLOCATOR_STRIPED_LOCK
+      // std::unique_lock<std::mutex> gg(manager_mtx);
+      // #endif
+      int cpu_id = dune_get_cpu_id() % kNumGlobalFreeLists;
       // if (cpu_id == 12 && dune_cnt >= 500000 && dune_cnt < 500500) {
       //    dune_printf("cpu_id %d acquired mutex %p freeFrames 11, freeing %d pages\n", cpu_id, &freelists[cpu_id].mtx, pages.size());		
       // }
@@ -676,7 +693,10 @@ struct FramesMemoryManager {
    }
 
    void freeFrame(Page* page) {
-      int cpu_id = dune_get_cpu_id();
+      // #ifndef TABBY_ALLOCATOR_STRIPED_LOCK
+      // std::unique_lock<std::mutex> gg(manager_mtx);
+      // #endif
+      int cpu_id = dune_get_cpu_id() % kNumGlobalFreeLists;
       // std::unique_lock<spinlock> g(freelists[cpu_id].mtx);
       std::unique_lock<std::mutex> g(freelists[cpu_id].mtx);
       freelists[cpu_id].push(page);
@@ -1263,6 +1283,9 @@ void BufferManager::handlePageFault(uint64_t addr, bool pf, bool newpage) {
             *pte = old_pte;
             goto retry;
          }
+         #ifndef TABBY_PREALLOCATION // if pre-allocation optimization is not enabled, we simulate the cost of zeroing the page that is required in Linux. This is for ablation study.
+         memset(page, 0, pageSize);
+         #endif
          if (!newpage) {
             //ret = pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
             ret = libaioInterface[workerThreadId].pread(pid, page, pageSize);
@@ -1287,6 +1310,9 @@ void BufferManager::handlePageFault(uint64_t addr, bool pf, bool newpage) {
                *pte = old_pte;
                goto retry;
             }
+            #ifndef TABBY_PREALLOCATION // if pre-allocation optimization is not enabled, we simulate the cost of zeroing the page that is required in Linux. This is for ablation study.
+            memset(page, 0, pageSize);
+            #endif
             TABBY_ASSERT(page->state.getVMAddress() == kTabbyInvalidAddr);
             //ret = pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
             //ret = iouringInterface[workerThreadId].pread(blockfd, page, pageSize, aligned_addr - kTabbyAddressSpaceStart);
@@ -2391,6 +2417,7 @@ pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
    bool protection = fec & FEC_P;
    bool write = fec & FEC_W;
    bool created = false;
+   dune_printf("pgflt_handler on %lx\n", addr);
    if (addr >= kTabbyAddressSpaceStart) {
       bm->handlePageFault(addr, true, false);
       return;
@@ -2401,6 +2428,7 @@ pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
    if (created) {
       dune_printf("physical page created for vm %lx\n", addr);
    }
+   
    ++pgflt_count;
 }
 
@@ -2669,7 +2697,7 @@ int main(int argc, char** argv) {
                v1 = __builtin_bswap64(i);
                memcpy(payload.data(), k1, sizeof(u64));
                bt.insert({k1, sizeof(KeyType)}, payload);
-               if (i % 10000000 == 0) {
+               if (i % 1000000 == 0) {
                   cerr << "loaded " << i << endl;
                }
             }

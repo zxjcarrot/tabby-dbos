@@ -24,6 +24,14 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <immintrin.h>
+#ifdef __cplusplus
+extern "C"{
+#endif 
+#include "dune.h"
+extern int dune_cnt;
+#ifdef __cplusplus
+}
+#endif
 
 #include "exmap.h"
 #include "exception_hack.hpp"
@@ -683,7 +691,6 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       }
 
       virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-      //madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
    } else {
       virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
@@ -707,7 +714,7 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
    writeCount = 0;
    batch = envOr("BATCH", 64);
 
-   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap << endl;
+   cerr << "vmcache " << "blk:" << path << " virtgb:" << virtSize/gb << " physgb:" << physSize/gb << " exmap:" << useExmap  << "virtMem starts at " << virtMem << ", size " << virtAllocSize << " pageState " << pageState << " size " << virtCount * sizeof(PageState) << endl;
 }
 
 void BufferManager::ensureFreePages() {
@@ -1816,11 +1823,20 @@ public:
       worker_threads.reserve(workers_count);
       for (u64 t_i = 0; t_i < workers_count; t_i++) {
          worker_threads.emplace_back([&, t_i]() {
+            stick_this_thread_to_core(t_i);
+            #ifdef ENABLE_DUNE
+            if (dune_enter()) {
+               printf("failed to enter dune mode\n");
+               exit(1);
+            }
+            #endif
+            dune_set_cpu_id(t_i);
             // -------------------------------------------------------------------------------------
             running_threads++;
             while (running_threads != (workers_count))
                ;
             auto& meta = worker_threads_meta[t_i];
+            //cerr << "Worker thread " << t_i << " mutex addr " << &meta.mutex << endl;
             while (keep_running) {
                std::unique_lock guard(meta.mutex);
                meta.cv.wait(guard, [&]() { return keep_running == false || meta.job_set; });
@@ -1925,7 +1941,25 @@ public:
       }
    }
 };
-
+static int pgflt_count = 0;
+static void
+pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
+{
+	int ret;
+	ptent_t *pte;
+	bool was_user = (tf->cs & 0x3);
+   bool nonpresent = (fec & FEC_P) == 0;
+   bool protection = fec & FEC_P;
+   bool write = fec & FEC_W;
+   bool created = false;
+   ret = dune_vm_lookup2(pgroot, (void *) addr, CREATE_NORMAL, &created, &pte);
+   assert(!ret);
+   *pte |= (PTE_P | PTE_W | PTE_U);// | PTE_ADDR(dune_va_to_pa((void *) addr)
+   if (created) {
+      dune_printf("page fault at %lx, fec %lx, pte %lx, PHY_ADDR %lx, was_user %d, nonpresent %d, protection %d, write %d, created %d\n", addr, fec, *pte,  PTE_ADDR(*pte), was_user, nonpresent, protection, write, created);
+      dune_die();
+   }
+}
 
 int main(int argc, char** argv) {
    exception_hack::init_phdr_cache();
@@ -1939,6 +1973,19 @@ int main(int argc, char** argv) {
          exit(1);
       }
    }
+
+
+   #ifdef ENABLE_DUNE
+   int ret = dune_init_and_enter();
+   if (ret) {
+      cerr << "failed to initialize dune" << endl;
+      exit(1);
+   } else {
+      cerr << "entered dune-mode, num_cores " << num_cores << endl;
+   }
+   dune_register_pgflt_handler(pgflt_handler); // register a default page fault handler
+   #endif
+   dune_set_cpu_id(0);
 
    unsigned nthreads = envOr("THREADS", 1);
    ThreadPool pool(nthreads);

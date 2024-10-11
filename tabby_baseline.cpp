@@ -683,7 +683,7 @@ BufferManager::BufferManager() : virtSize(envOr("VIRTGB", 16)*gb), physSize(envO
       }
 
       virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_SHARED, exmapfd, 0);
-      //madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
+      madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
    } else {
       virtMem = (Page*)mmap(NULL, virtAllocSize, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
       madvise(virtMem, virtAllocSize, MADV_NOHUGEPAGE);
