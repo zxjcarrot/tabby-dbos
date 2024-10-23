@@ -59,8 +59,6 @@ extern int dune_cnt;
 #endif
 
 
-#include "exmap.h"
-
 __thread uint16_t workerThreadId = 0;
 __thread int32_t tpcchistorycounter = 0;
 #include "tpcc/TPCCWorkload.hpp"
@@ -84,12 +82,6 @@ uint64_t rdtsc() {
    uint32_t hi, lo;
    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
    return static_cast<uint64_t>(lo)|(static_cast<uint64_t>(hi)<<32);
-}
-
-// exmap helper function
-static int exmapAction(int exmapfd, exmap_opcode op, u16 len) {
-   struct exmap_action_params params_free = { .interface = workerThreadId, .iov_len = len, .opcode = (u16)op, };
-   return ioctl(exmapfd, EXMAP_IOCTL_ACTION, &params_free);
 }
 
 // allocate memory using huge pages
@@ -726,7 +718,6 @@ struct BufferManager {
    u64 physSize;
    u64 virtCount;
    u64 physCount;
-   struct exmap_user_interface* exmapInterface[maxWorkerThreads];
    vector<LibaioInterface> libaioInterface;
    //vector<IOUringInterface> iouringInterface;
    std::vector<int> blockfds;
@@ -1409,22 +1400,7 @@ void BufferManager::unfixX(PID pid) {
 }
 
 void BufferManager::readPage(PID pid) {
-   // if (useExmap) {
-   //    for (u64 repeatCounter=0; ; repeatCounter++) {
-   //       int ret = pread(exmapfd, virtMem+pid, pageSize, workerThreadId);
-   //       if (ret == pageSize) {
-   //          assert(ret == pageSize);
-   //          readCount++;
-   //          return;
-   //       }
-   //       cerr << "readPage errno: " << errno << " pid: " << pid << " workerId: " << workerThreadId << endl;
-   //       ensureFreePages();
-   //    }
-   // } else {
-   //int ret = pread(blockfd, virtMem+pid, pageSize, pid*pageSize);
-   //assert(ret==pageSize);
    readCount++;
-   //}
 }
 
 atomic<long> evict_rounds{0};
@@ -1496,52 +1472,13 @@ void BufferManager::evict() {
       u64 v = ps.getWord();
       return (VMPageState::getState(v) != VMPageState::Marked) || !ps.tryLockX(v);
    }), toEvict.end());
-   
 
-   // for (Page* page : toEvict) {
-   //    VMPageState& ps = page->state;
-   //    u64 v = ps.getWord();
-   //    assert(VMPageState::getState(v) == VMPageState::Locked);
-   //    assert(VMPageState::getVMAddress(v) != kTabbyInvalidAddr);
-   //    ps.unlockXInvalidated();
-   //    //frameMemManager->freeFrame(page);
-   // }
-   // if (toEvict.empty() == false) {
-   //    frameMemManager->freeFrames(toEvict);
-   //    toEvict.clear();
-   // }
-
-   //physUsedCount -= toEvict.size();
 
    evict_clean_pages += toEvict.size();
-   //toEvict.clear();
 
    evict_written_pages += toWrite.size();
    evict_rounds += 1;
-   //toEvict = toWrite;
    toEvict.insert(toEvict.end(), toWrite.begin(), toWrite.end());
-   // 3. try to upgrade lock for dirty page candidates
-   // for (auto& pid : toWrite) {
-   //    PageState& ps = getPageState(pid);
-   //    u64 v = ps.stateAndVersion;
-   //    if ((PageState::getState(v) == 1) && ps.stateAndVersion.compare_exchange_weak(v, PageState::sameVersion(v, PageState::Locked)))
-   //       toEvict.push_back(pid);
-   //    else
-   //       ps.unlockS();
-   // }
-
-   // 4. remove from page table
-   // if (useExmap) {
-   //    for (u64 i=0; i<toEvict.size(); i++) {
-   //       exmapInterface[workerThreadId]->iov[i].page = toEvict[i];
-   //       exmapInterface[workerThreadId]->iov[i].len = 1;
-   //    }
-   //    if (exmapAction(exmapfd, EXMAP_OP_FREE, toEvict.size()) < 0)
-   //       die("ioctl: EXMAP_OP_FREE");
-   // } else {
-   // for (u64& pid : toEvict)
-   //    madvise(virtMem + pid, pageSize, MADV_DONTNEED);
-   //}
 
    // 5. remove from hash table and unlock
    for (Page* page : toEvict) {
@@ -2408,7 +2345,7 @@ struct vmcacheAdapter
 
 static int pgflt_count = 0;
 static void
-pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
+tabby_pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
 {
 	int ret;
 	ptent_t *pte;
@@ -2417,7 +2354,7 @@ pgflt_handler(uintptr_t addr, uint64_t fec, struct dune_tf *tf)
    bool protection = fec & FEC_P;
    bool write = fec & FEC_W;
    bool created = false;
-   dune_printf("pgflt_handler on %lx\n", addr);
+   dune_printf("tabby_pgflt_handler on %lx\n", addr);
    if (addr >= kTabbyAddressSpaceStart) {
       bm->handlePageFault(addr, true, false);
       return;
@@ -2637,7 +2574,7 @@ int main(int argc, char** argv) {
       cerr << "entered dune-mode, num_cores " << num_cores << endl;
    }
    dune_register_syscall_handler(syscall_handler);
-   dune_register_pgflt_handler(pgflt_handler);
+   dune_register_pgflt_handler(tabby_pgflt_handler);
    #endif
    dune_set_cpu_id(0);
    bm = new BufferManager();

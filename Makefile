@@ -31,3 +31,6 @@ clean:
 	rm tabby_baseline_priv -f
 	rm tabby_no_preallocation_and_no_allocator_striped_lock -f
 	rm tabby_no_preallocation -f
+	rm perf.data -f
+	rm perf.data.old -f
+	rm output.csv -f
