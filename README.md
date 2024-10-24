@@ -1,11 +1,11 @@
-# tabby
+# Tabby
 
-Code for DB-OS co-design buffer manager described in "Practical DB-OS Co-Design with Privileged DB Process".
+Code for DB-OS co-designed buffer manager described in "Practical DB-OS Co-Design with Privileged DB Process".
 The code is based on [vmcache](https://github.com/viktorleis/vmcache).
 
 ## Environment Variables
 
-* BLOCK: storage block device (e.g. /dev/nvme0n1 or /dev/md0); default=/tmp/bm
+* BLOCK: storage file (e.g. /mnt/nvme0n1/datafile); default=/tmp/bm
 * VIRTGB: virtual memory allocation in GB (e.g., 1024), should be at least device size; default=16
 * PHYSGB: physical memory allocation in GB = buffer pool size, should be less than available RAM; default=4
 * BATCH: batch size for eviction in pages; default=64
@@ -21,8 +21,9 @@ The code is based on [vmcache](https://github.com/viktorleis/vmcache).
 
 ## Dependencies and Configuration
 
-We need the libaoi library. On Ubuntu: `sudo apt install libaio-dev`.
+* libaio: We need the libaio library. On Ubuntu: `sudo apt install libaio-dev`. On CentOS: `sudo yum install -y libaio-devel.x86_64`
 You will probably also need to set `vm.overcommit_memory = 1` in `/etc/sysctl.conf`. Otherwise larger values of VIRTGB will not work.
+* libdbos/libdune: We need the libdbos and dune kernel module library. See [README](../../README.md) of libdbos/libdune for instructions.
 
 ## Low-Hanging Fruit (TODO)
 
